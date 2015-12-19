@@ -26,6 +26,7 @@ from lib.ast import (Ast_Branch, Ast_Goto, Ast_Loop, Ast_IfGoto, Ast_Ifelse,
         Ast_AndIf)
 from lib.arch.x86.output import ASSIGNMENT_OPS
 from lib.arch.x86.utils import is_uncond_jump, is_call
+from lib.fileformat.binary import SYM_FUNC
 
 
 FUSE_OPS = set(ASSIGNMENT_OPS)
@@ -55,8 +56,6 @@ def assign_colors(ctx, ast):
 
     elif isinstance(ast, Ast_Loop):
         assign_colors(ctx, ast.branch)
-        if ast.epilog != None:
-            assign_colors(ctx, ast.epilog)
 
 
 def fuse_inst_with_if(ctx, ast):
@@ -80,8 +79,6 @@ def fuse_inst_with_if(ctx, ast):
 
     elif isinstance(ast, Ast_Loop):
         fuse_inst_with_if(ctx, ast.branch)
-        if ast.epilog != None:
-            fuse_inst_with_if(ctx, ast.epilog)
 
 
 def search_local_vars(ctx, ast):
@@ -118,15 +115,13 @@ def search_local_vars(ctx, ast):
 
     elif isinstance(ast, Ast_Loop):
         search_local_vars(ctx, ast.branch)
-        if ast.epilog != None:
-            search_local_vars(ctx, ast.epilog)
 
 
 def search_canary_plt(ctx, ast):
     fname = "__stack_chk_fail@plt"
     if fname not in ctx.dis.binary.symbols:
         return
-    faddr = ctx.dis.binary.symbols[fname]
+    faddr = ctx.dis.binary.symbols[fname][0]
     __rec_search_canary_plt(faddr, ctx, ast, [])
 
 
@@ -176,5 +171,3 @@ def __rec_search_canary_plt(faddr, ctx, ast, last_block):
 
     elif isinstance(ast, Ast_Loop):
         __rec_search_canary_plt(faddr, ctx, ast.branch, last_block)
-        if ast.epilog != None:
-            __rec_search_canary_plt(faddr, ctx, ast.epilog, last_block)

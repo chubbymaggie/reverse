@@ -20,17 +20,18 @@
 import sys
 from textwrap import dedent
 from pathlib import Path
+from lib.utils import die, error
 
 
 def default_custom_file():
     filename = str(Path(__file__).parent.parent / "custom_colors.py")
     with open(filename, "w+") as fd:
         fd.write(dedent("""\
-            VERSION = 1
+            VERSION = 1.3
 
             class COLOR:
                 def __init__(self, val, bold):
-                    self.val  = str(val)
+                    self.val  = val
                     self.bold = bold
 
             COLOR_SECTION        = COLOR(81, False)
@@ -42,7 +43,9 @@ def default_custom_file():
             COLOR_STRING         = COLOR(144, False)
             COLOR_SYMBOL         = COLOR(144, False)
             COLOR_RETCALL        = COLOR(161, False)
-            COLOR_INTERN_COMMENT = COLOR(38, False)
+            COLOR_INTERN_COMMENT = COLOR(217, False)
+            COLOR_CODE_ADDR      = COLOR(220, False)
+            COLOR_USER_COMMENT   = COLOR(38, False)
             """))
 
 
@@ -51,6 +54,7 @@ try:
 except:
     default_custom_file()
     from custom_colors import *
+    print("the file custom_colors.py has been created")
 
 
 # Old versions of custom_colors.py
@@ -58,14 +62,7 @@ try:
     COLOR_INTERN_COMMENT
     VERSION
 except:
-    filename = str(Path(__file__).parent.parent / "custom_colors.py")
-    with open(filename, "a") as fd:
-        fd.write((dedent("""\n\
-        COLOR_INTERN_COMMENT = COLOR(38, False)
-        VERSION = 1""")))
-    print("Your file custom_colors.py has been updated.")
-    print("You can run again your command")
-    sys.exit(0)
+    VERSION = 0
 
 
 ctx = None
@@ -93,8 +90,8 @@ def color_class(text, c):
     if not ctx.color:
         return text
     if c.bold:
-        return "\x1b[38;5;" + c.val + "m" + bold(text) + "\x1b[0m"
-    return "\x1b[38;5;" + c.val + "m" + text + "\x1b[0m"
+        return "\x1b[38;5;" + str(c.val) + "m" + bold(text) + "\x1b[0m"
+    return "\x1b[38;5;" + str(c.val) + "m" + text + "\x1b[0m"
 
 
 def bold(text):
@@ -132,6 +129,24 @@ def color_addr(addr, print_colon=True):
     if addr in ctx.addr_color:
         return color(s, ctx.addr_color[addr])
     return color_class(s, COLOR_ADDR)
+
+
+def color_addr_normal(addr, print_colon=True):
+    s = hex(addr)
+    if print_colon:
+        s += ": "
+    return color_class(s, COLOR_ADDR)
+
+
+def color_label(addr, print_colon=True):
+    if addr not in ctx.labels:
+        return None
+    l = str(ctx.labels[addr])
+    if print_colon:
+        l += ":"
+    if addr in ctx.addr_color:
+        return color(l, ctx.addr_color[addr])
+    return color_class(l, COLOR_ADDR)
 
 
 def color_string(text):

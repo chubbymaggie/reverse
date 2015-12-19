@@ -1,4 +1,4 @@
-function main {
+function main (.text) {
     int64_t var1_canary
     int32_t var2
     0x400526: push rbp
@@ -10,11 +10,12 @@ function main {
     0x400540: var2 = 0 # mov dword ptr [rbp - 0x94], 0
     0x40054a: jmp 0x40055c
     loop {
+        loop_0x40055c:
         # 0x40055c: cmp dword ptr [rbp - 0x94], 0x63
         # 0x400563: jle 0x40054c
         if (var2 > 99)  goto 0x400565
         0x40054c: eax = var2 # mov eax, dword ptr [rbp - 0x94]
-        0x400552: rax = eax # cdqe 
+        0x400552: rax = eax # cdqe
         0x400554: *(rbp + rax - 144) = 'a' # mov byte ptr [rbp + rax - 0x90], 0x61
     }
     0x400565: eax = 0 # mov eax, 0
@@ -22,8 +23,9 @@ function main {
     # 0x40056e: xor rdx, qword ptr fs:[0x28]
     # 0x400577: je 0x40057e
     if ((rdx ^= *(fs + 40)) != 0) {
-        0x400579: call 0x400400 <__stack_chk_fail@plt>
+        0x400579: call __stack_chk_fail@plt
     }
-    0x40057e: leave 
-    0x40057f: ret 
+    ret_0x40057e:
+    0x40057e: leave
+    0x40057f: ret
 }

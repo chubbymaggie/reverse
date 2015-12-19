@@ -17,9 +17,11 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
+from lib.fileformat.binary import SectionAbs
+
 
 class Raw:
-    def __init__(self, filename, raw_type, raw_base, raw_big_endian):
+    def __init__(self, classbinary, filename, raw_type, raw_base, raw_big_endian):
         import capstone as CAPSTONE
 
         self.raw = open(filename, "rb").read()
@@ -43,6 +45,21 @@ class Raw:
             "mips64": CAPSTONE.CS_MODE_MIPS64,
         }
 
+        classbinary._sorted_sections = [raw_base]
+
+        classbinary._abs_sections[raw_base] = SectionAbs(
+                "raw",
+                raw_base,
+                len(self.raw),
+                len(self.raw),
+                True,
+                False,
+                self.raw)
+
+
+    def load_section_names(self):
+        return
+
 
     def load_static_sym(self):
         return
@@ -52,35 +69,18 @@ class Raw:
         return
 
 
-    def load_data_sections(self):
-        return
-
-
     def is_address(self, imm):
         return None, False
-
-
-    def get_section_meta(self, addr):
-        return "", self.raw_base, self.raw_base + len(self.raw) - 1
-
-
-    def check_addr(self, addr):
-        ad = addr - self.raw_base
-        if ad >= len(self.raw) or ad < 0:
-            return (False, False)
-        return (True, True)
 
 
     def section_stream_read(self, addr, size):
         ad = addr - self.raw_base
         if ad >= len(self.raw) or ad < 0:
             return b""
-        end = self.raw_base + len(self.raw)
-        return self.raw[ad:ad + min(size, end - ad)]
-
-
-    def get_string(self, addr):
-        return ""
+        end = min(self.raw_base - ad + len(self.raw), size)
+        if ad == 0 and end == len(self.raw):
+            return self.raw
+        return self.raw[ad:ad + end]
 
 
     def get_arch(self):
@@ -99,8 +99,4 @@ class Raw:
 
 
     def get_entry_point(self):
-        return 0
-
-
-    def iter_sections(self):
-        return []
+        return self.raw_base

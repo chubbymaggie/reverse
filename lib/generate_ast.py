@@ -17,324 +17,684 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
-import time
+import sys
+from time import time
 
-from lib.ast import (Ast_Branch, Ast_Comment, Ast_Goto, Ast_Loop,
-        Ast_IfGoto, Ast_Ifelse, Ast_AndIf)
+from lib.ast import (Ast_Branch, Ast_Goto, Ast_Loop, Ast_If_cond,
+        Ast_IfGoto, Ast_Ifelse, Ast_AndIf, Ast_Comment)
 from lib.utils import BRANCH_NEXT, BRANCH_NEXT_JUMP, debug__
 from lib.exceptions import ExcIfelse
 
 
-def get_ast_ifgoto(ctx, paths, curr_loop_idx, inst):
-    nxt = ctx.gph.link_out[inst.address]
+class Endpoint():
+    def __init__(self, ast, unseen, l_start):
+        self.ast = [ast]
+        self.unseen = unseen
+        self.loop_start = [l_start]
 
-    c1 = paths.loop_contains(curr_loop_idx, nxt[BRANCH_NEXT])
-    c2 = paths.loop_contains(curr_loop_idx, nxt[BRANCH_NEXT_JUMP])
-
-    if c1 and c2:
-        raise ExcIfelse(inst.addr)
-
-    # If the address of the jump is inside the loop, we
-    # invert the conditions. example :
-    #
-    # jmp conditions
-    # loop:
-    #    code ...
-    # conditions:
-    #    cmp ...
-    #    jg endloop
-    #    cmp ...
-    #    jne loop
-    # endloop:
-    #
-    # Here the last jump point inside the loop. We want to
-    # replace by this : 
-    #
-    # loop {
-    #    cmp ...
-    #    jg endloop
-    #    cmp ...
-    #    je endloop
-    #    code ...
-    # } # here there is an implicit jmp to loop
-    # endloop:
-    #
-
-    cond_id = ctx.libarch.utils.get_cond(inst)
-    br = nxt[BRANCH_NEXT_JUMP]
-    if c2:
-        cond_id = ctx.libarch.utils.invert_cond(inst)
-        br = nxt[BRANCH_NEXT]
-
-    return Ast_IfGoto(inst, cond_id, br)
+    def rendezvous(self, ast, prev, l_start):
+        self.ast.append(ast)
+        self.loop_start.append(l_start)
+        if prev in self.unseen:
+            self.unseen.remove(prev)
 
 
-def get_ast_branch(ctx, paths, curr_loop_idx=[], last_else=-1, endif=-1):
-    ast = Ast_Branch()
-    if_printed = False
+def get_first_addr(ast):
+    # Assume that there are no Ast_Comment
 
-    if paths.rm_empty_paths():
-        return ast
+    if isinstance(ast, list):
+        return ast[0].address
+
+    if isinstance(ast, Ast_Branch):
+        if len(ast.nodes) > 0:
+            return get_first_addr(ast.nodes[0])
+
+    if isinstance(ast, Ast_Ifelse):
+        # Any instructions at the moment so we can use the jump inst
+        return ast.jump_inst.address
+
+    if isinstance(ast, Ast_Loop):
+        if len(ast.branch.nodes) > 0:
+            return get_first_addr(ast.branch.nodes[0])
+
+    if isinstance(ast, Ast_Goto):
+        return ast.addr_jump
+
+    if isinstance(ast, Ast_IfGoto):
+        return ast.orig_jump.address
+
+    if isinstance(ast, Ast_AndIf):
+        return ast.orig_jump.address
+
+    if isinstance(ast, Ast_If_cond):
+        if len(ast.br.nodes) > 0:
+            return get_first_addr(ast.br.nodes[0])
+
+    return -1
+
+
+def get_next_addr(ast):
+    par = ast.parent
+    if par is None:
+        return -1
+    i = ast.idx_in_parent + 1
+
+    # Get the next address of the parent ast
+    if i == len(par.nodes):
+        return get_next_addr(par)
+
+    return get_first_addr(par.nodes[i])
+
+
+# Returns the first address of the current loop only if the i th ast
+# is the last in the parent ast.
+def is_last_in_loop(ast, i):
+    par = ast.parent
+    if par is None:
+        return -1
+
+    is_last = i == len(ast.nodes) - 1
+    a = ast.parent.nodes[ast.idx_in_parent]
+    if isinstance(a, Ast_Loop) and is_last:
+        return get_first_addr(a)
+
+    if not is_last:
+        return -1
+
+    return is_last_in_loop(par, ast.idx_in_parent)
+
+
+def remove_all_unnecessary_goto(ast):
+    if isinstance(ast, Ast_Branch):
+        # Remove all last Ast_Goto, only if the previous is not an andif
+        if len(ast.nodes) > 0 and isinstance(ast.nodes[-1], Ast_Goto):
+            if len(ast.nodes) <= 1 or not isinstance(ast.nodes[-2], Ast_AndIf):
+                if not ast.nodes[-1].dont_remove:
+                    nxt = get_next_addr(ast)
+                    if ast.nodes[-1].addr_jump == nxt:
+                        del ast.nodes[-1]
+
+        for n in ast.nodes:
+            if not isinstance(n, list):
+                remove_all_unnecessary_goto(n)
+
+    elif isinstance(ast, Ast_Ifelse):
+        remove_all_unnecessary_goto(ast.br_next)
+        remove_all_unnecessary_goto(ast.br_next_jump)
+
+    elif isinstance(ast, Ast_Loop):
+        if isinstance(ast.branch.nodes[-1], Ast_Goto):
+            if get_first_addr(ast) == ast.branch.nodes[-1].addr_jump:
+                del ast.branch.nodes[-1]
+        remove_all_unnecessary_goto(ast.branch)
+
+
+def fix_non_consecutives(ctx, ast):
+    if isinstance(ast, Ast_Branch):
+        idx_to_add = {}
+
+        for i, n in enumerate(ast.nodes):
+            if isinstance(n, list):
+                ad = n[0].address
+                if ad in ctx.gph.uncond_jumps_set or ad not in ctx.gph.link_out:
+                    continue
+
+                nxt1 = ctx.gph.link_out[ad][BRANCH_NEXT]
+
+                if i == len(ast.nodes) - 1:
+                    loop_start = is_last_in_loop(ast, i)
+                    if loop_start != -1:
+                        if nxt1 != loop_start:
+                            idx_to_add[i + 1] = nxt1
+                        continue
+                    nxt2 = get_next_addr(ast)
+                else:
+                    nxt2 = get_first_addr(ast.nodes[i + 1])
+
+                if nxt1 != nxt2:
+                    idx_to_add[i + 1] = nxt1
+            else:
+                fix_non_consecutives(ctx, n)
+
+        if not idx_to_add:
+            return
+
+        # Add from the end of the nodes list
+        lst = list(idx_to_add.keys())
+        lst.sort()
+        for i in reversed(lst):
+            ast.nodes.insert(i, Ast_Goto(idx_to_add[i]))
+
+    elif isinstance(ast, Ast_Ifelse):
+        fix_non_consecutives(ctx, ast.br_next)
+        fix_non_consecutives(ctx, ast.br_next_jump)
+
+    elif isinstance(ast, Ast_Loop):
+        fix_non_consecutives(ctx, ast.branch)
+
+
+def search_endpoint(ctx, stack, ast, entry, l_set, l_prev_loop, l_start):
+    endp = __search_endpoint(ctx, stack, ast, entry, l_set, l_prev_loop, l_start)
+
+    if endp == -1:
+        return -1
+
+    # Check if we found an endpoint in a subloop : for a "if" it's not possible
+    # that the end goes in a loop, so we return -1 if this is the case.
+
+    if l_prev_loop == -1:
+        l = ctx.gph.not_in_loop
+    else:
+        # l_set contains also subloops, here we just want the current loop
+        l = ctx.gph.loops_set[(l_prev_loop, l_start)]
+
+    if endp not in l:
+        return -1
+
+    return endp
+
+
+def __search_endpoint(ctx, stack, ast, entry, l_set, l_prev_loop, l_start):
+    waiting = {}
+    visited = set()
+    done = set()
+
+    stack = []
+    for n in ctx.gph.link_out[entry]:
+        stack.append((entry, n))
 
     while 1:
-        ad = paths.first()
-        if ad in ctx.seen:
-            ast.add(Ast_Goto(ad))
-            return ast
+        while stack:
+            prev, ad = stack.pop(-1)
 
-        # Stop at the first split or loop
-        nb_commons, is_loop, is_ifelse, force_stop_addr = \
-            paths.head_last_common(curr_loop_idx)
+            # Don't go outside the current loop : we want to search
+            # an if-endpoint.
+            if l_prev_loop != -1 and ad not in l_set:
+                continue
 
-        if nb_commons > 0:
-            common_path = paths.pop(nb_commons)
+            # If "ad" is in last_loop_node we are sure that the path
+            # will loop. So don't keep it if it's a subloop.
 
-            for ad in common_path:
-                ctx.seen.add(ad)
-                blk = ctx.gph.nodes[ad]
+            if ad in ctx.gph.last_loop_node and \
+                    (l_prev_loop, l_start) not in ctx.gph.last_loop_node[ad]:
+                continue
 
-                # Here if we have conditional jump, it's not a ifelse,
-                # it's a condition for a loop. It will be replaced by a
-                # goto. ifgoto are skipped by head_last_common.
-                if ad in ctx.gph.cond_jumps_set:
-                    inst = blk[0] # first inst
-                    ast.add(get_ast_ifgoto(ctx, paths, curr_loop_idx, inst))
-                else:
-                    ast.add(blk)
+            # If endpoint == loop : maybe the endpoint is at the end of the loop
+            # If we have multiple link in, and if it's not a new loop, wait
 
-            if paths.rm_empty_paths():
-                return ast
+            if ad not in done:
+                lkin = ctx.gph.link_in[ad]
 
-            ad = paths.first()
-            if ad in ctx.seen:
-                ast.add(Ast_Goto(ad))
-                return ast
+                if ad == l_start or len(lkin) > 1:
+                    unseen = get_unseen_links_in(ad, l_set, l_prev_loop, l_start)
+                    if len(unseen) > 1:
+                        if ad in waiting:
+                            if prev in waiting[ad]:
+                                waiting[ad].remove(prev)
+                        else:
+                            unseen.remove(prev)
+                            waiting[ad] = unseen
+                        continue
 
-        # See comments in paths.__enter_new_loop
-        if force_stop_addr != 0:
-            ad = paths.first()
-            blk = ctx.gph.nodes[ad]
-            ast.add(blk)
+            if ad in visited:
+                continue
 
-            if ad not in ctx.gph.uncond_jumps_set:
-                ast.add(Ast_Goto(ctx.gph.link_out[blk[0].address][BRANCH_NEXT]))
-            break
+            visited.add(ad)
 
-        if is_loop:
-            # last_else == -1
-            # -> we can't go to a same else inside a loop
-            a, endpoint = get_ast_loop(ctx, paths, curr_loop_idx, -1, endif)
-            ast.add(a)
-        elif is_ifelse:
-            a, endpoint = get_ast_ifelse(
-                               ctx, paths, curr_loop_idx,
-                               last_else, if_printed, endif)
-            if_printed = isinstance(a, Ast_Ifelse)
-            ast.add(a)
-        else:
-            endpoint = paths.first()
+            if ad in ctx.gph.link_out:
+                for n in ctx.gph.link_out[ad]:
+                    stack.append((ad, n))
 
-        if endpoint == -1 or paths.goto_addr(endpoint):
-            break
+        if not waiting:
+            return -1
+
+        if len(waiting) == 1:
+            ad = next(iter(waiting.keys()))
+            return ad
+
+        stack = []
+
+        restart = True
+        while restart:
+            restart = False
+
+            for ad in list(waiting):
+                if len(waiting[ad]) > 0:
+                    continue
+
+                del waiting[ad]
+                done.add(ad)
+                stack.append((-1, ad))
+
+            # If the stack is still empty but if we have still some waiting
+            # nodes, search if paths are really possible. If not, delete
+            # a dependence.
+
+            if not stack and waiting:
+                for ad in set(waiting):
+                    for i in set(waiting[ad]):
+                        if not ctx.gph.path_exists(entry, i):
+                            waiting[ad].remove(i)
+                            if len(waiting[ad]) > 0:
+                                restart = True
+                            else:
+                                del waiting[ad]
+
+                if len(waiting) == 1:
+                    ad = next(iter(waiting.keys()))
+                    return ad
+
+        if not stack:
+            return -1
+
+
+def get_unseen_links_in(ad, l_set, l_prev_loop, l_start):
+    unseen = set(ctx.gph.link_in[ad])
+
+    # Is it the beginning of a loop ?
+    # Remove internal links to the beginning of the loop
+    if (l_start, ad) in ctx.gph.loops_all:
+        sub_loop = ctx.gph.loops_all[(l_start, ad)]
+        for prev in ctx.gph.link_in[ad]:
+            if prev in sub_loop and prev in unseen:
+                unseen.remove(prev)
+
+    if l_set is None:
+        return unseen
+
+    # Remove external jumps which are outside the current loop
+    for prev in ctx.gph.link_in[ad]:
+        if prev not in l_set and prev in unseen:
+            unseen.remove(prev)
+
+    return unseen
+
+
+def remove_unnecessary_goto(ast, ad):
+    if len(ast.nodes) > 1:
+        if isinstance(ast.nodes[-1], Ast_Goto) and \
+                ast.nodes[-1].addr_jump == ad:
+            ast.nodes.pop(-1)
+
+
+def rm_waiting(ctx, waiting, ad):
+    # Get the ast which has the smallest level
+
+    min_level_idx = -1
+    list_ast = waiting[ad].ast
+    list_loop_start = waiting[ad].loop_start
+
+    for i, a in enumerate(list_ast):
+        if (list_loop_start[i], ad) in ctx.gph.false_loops:
+            continue
+        if min_level_idx == -1 or a.level < list_ast[min_level_idx].level:
+            min_level_idx = i
+
+    if min_level_idx == -1:
+        print("errorD: this is a bug, please report")
+        sys.exit(1)
+
+    ast = list_ast[min_level_idx]
+
+    # Add goto on each other ast
+    # If they are finally unuseful, they will be deleted with
+    # remove_unnecessary_goto or in remove_unnecessary_goto
+    for i, a in enumerate(list_ast):
+        if i == min_level_idx:
+            continue
+        if len(a.nodes) == 0:
+            a.add(Ast_Goto(ad))
+            continue
+        # The previous instruction has not `ad` as the next instruction
+        if isinstance(a.nodes[-1], list):
+            prev = a.nodes[-1][0].address
+            if prev in ctx.gph.uncond_jumps_set:
+                continue
+            if prev in ctx.gph.link_out:
+                n = ctx.gph.link_out[prev][BRANCH_NEXT]
+                if n != ad:
+                    a.add(Ast_Goto(n))
+                    continue
+        # The previous is a goto, skip it
+        if isinstance(a.nodes[-1], Ast_Goto):
+            continue
+        a.add(Ast_Goto(ad))
+
+    waiting[ad].ast.clear()
+    del waiting[ad]
 
     return ast
 
 
-# TODO move in class Paths
-# Assume that the beginning of paths is the beginning of a loop
-def paths_is_infinite(paths):
-    for k, p in paths.paths.items():
-        for addr in p:
-            if addr in paths.gph.cond_jumps_set:
-                nxt = paths.gph.link_out[addr]
-                if nxt[BRANCH_NEXT] not in paths or \
-                   nxt[BRANCH_NEXT_JUMP] not in paths: \
-                    return False
-    return True
+def manage_endpoint(ctx, waiting, ast, prev, ad, l_set, l_prev_loop,
+                    l_start, ad_is_visited):
+    if ad not in ctx.gph.link_in or len(ctx.gph.link_in[ad]) <= 1:
+        return ast
+
+    # If ad_is_visited is False it means this is a prevision for a future
+    # visit on this node. Here prev has no sense.
+
+    if not ad_is_visited:
+        if ad not in waiting:
+            unseen = get_unseen_links_in(ad, l_set, l_prev_loop, l_start)
+            waiting[ad] = Endpoint(ast, unseen, l_start)
+        return None
+
+    if ad in waiting:
+        waiting[ad].rendezvous(ast, prev, l_start)
+
+        if len(waiting[ad].unseen) != 0:
+            return None
+
+        ast = rm_waiting(ctx, waiting, ad)
+        return ast
+
+    unseen = get_unseen_links_in(ad, l_set, l_prev_loop, l_start)
+
+    if len(unseen) > 1:
+        unseen.remove(prev)
+        waiting[ad] = Endpoint(ast, unseen, l_start)
+        return None
+
+    return ast
 
 
-def get_ast_loop(ctx, paths, last_loop_idx, last_else, endif):
-    ast = Ast_Loop()
-    curr_loop_idx = paths.get_loops_idx()
-    first_blk = ctx.gph.nodes[paths.get_loop_start(curr_loop_idx)]
-
-    if first_blk[0].address in ctx.gph.cond_jumps_set:
-        ast.add(get_ast_ifgoto(ctx, paths, curr_loop_idx, first_blk[0]))
-    else:
-        ast.add(first_blk)
-
-    loop_paths, endloops, endloops_start = \
-        paths.extract_loop_paths(curr_loop_idx, last_loop_idx, endif)
-
-    # Checking if endloop == [] to determine if it's an 
-    # infinite loop is not sufficient
-    # tests/nestedloop2
-    ast.set_infinite(paths_is_infinite(loop_paths))
-
-    addr = loop_paths.pop(1)[0]
-    ctx.seen.add(addr)
-    ast.add(get_ast_branch(ctx, loop_paths, curr_loop_idx, last_else))
-
-    if not endloops:
-        return ast, -1
-
-    epilog = Ast_Branch()
-    if len(endloops) > 1:
-        epilog_num = 1
-
-        for i, el in enumerate(endloops[:-1]):
-            if isinstance(el, Ast_Goto):
-                epilog.add(el)
-                continue
-
-            if el.first() in endloops_start:
-                epilog.add(Ast_Comment("endloop " + str(epilog_num)))
-                epilog_num += 1
-
-            epilog.add(get_ast_branch(ctx, el, last_loop_idx, last_else))
-
-        if endloops[-1].first() in endloops_start:
-            epilog.add(Ast_Comment("endloop " + str(epilog_num)))
-
-        ast.set_epilog(epilog)
-
-    return ast, endloops[-1].first()
-
-
-def get_ast_ifelse(ctx, paths, curr_loop_idx, last_else, is_prev_andif, endif):
-    addr = paths.pop(1)[0]
-    ctx.seen.add(addr)
-    paths.rm_empty_paths()
-    jump_inst = ctx.gph.nodes[addr][0]
-    nxt = ctx.gph.link_out[addr]
-
-    if_addr = nxt[BRANCH_NEXT]
-    else_addr = nxt[BRANCH_NEXT_JUMP] if len(nxt) == 2 else -1
-
-    # If endpoint == -1, it means we are in a sub-if and the endpoint 
-    # is after. When we create_split, only address inside current
-    # if and else are kept.
-    endpoint = paths.first_common_ifelse(curr_loop_idx, else_addr)
-    split, else_addr = paths.split(addr, endpoint)
-
-    # is_prev_and_if : better output (tests/if5)
-    #
-    # example C file :
-    #
-    # if 1 {
-    #   if 2 { 
-    #     ...
-    #   }
-    #   if 3 {
-    #     ...
-    #   }
-    # }
-    #
-    #
-    # output without the is_prev_andif. This is correct, the andif is 
-    # attached to the "if 1", but it's not very clear.
-    #
-    # if 1 {
-    #   if 2 { 
-    #     ...
-    #   }
-    #   and if 3
-    #   ...
-    # }
-    #
-    # output with the is_prev_andif :
-    # Instead of the andif, we have the same code as the original.
-    #
-
-    # last_else allows to not repeat the else part when there are some 
-    # and in the If. example :
-    #
-    # if (i > 0 && i == 1) {
-    #     part 1
-    # } else {
-    #     part 2
-    # }
-    #
-    #
-    # output without this "optimization" :
-    #
-    # ...
-    # if > {
-    #     ...
-    #     if == {
-    #         part 1
-    #     } else != {
-    #         part 2
-    #     }
-    # } else <= {
-    #     part 2
-    # }
-    # 
-    #
-    # output with "optimization" :
-    #
-    # ...
-    # if > {
-    #     ...
-    #     and if ==    means that if the condition is false, goto else
-    #     part 1
-    # } else <= {
-    #     part 2
-    # }
-    #
-
-    if ctx.print_andif:
-        if last_else != -1 and not is_prev_andif:
-            # TODO not sure about endpoint == -1
-            # tests/break3
-            if if_addr == last_else and endpoint == -1:
-                return (Ast_AndIf(jump_inst, ctx.libarch.utils.get_cond(jump_inst)),
-                        else_addr)
-
-            # if else_addr == -1 or else_addr == last_else:
-            if else_addr != -1 and (else_addr == last_else or else_addr == endif) or \
-                    last_else == endif and endif == endpoint and endpoint != -1:
-                endpoint = ctx.gph.link_out[addr][BRANCH_NEXT]
-                return (Ast_AndIf(jump_inst, ctx.libarch.utils.invert_cond(jump_inst)),
-                        endpoint)
-
-    if else_addr == -1:
-        else_addr = last_else
-
-    if endpoint == -1:
-        endpoint = endif
-
-    a1 = get_ast_branch(ctx, split[BRANCH_NEXT_JUMP], curr_loop_idx, -1, endpoint)
-    a2 = get_ast_branch(ctx, split[BRANCH_NEXT], curr_loop_idx, else_addr, endpoint)
-
-    return (Ast_Ifelse(jump_inst, a1, a2), endpoint)
-
-
-
-def generate_ast(ctx__, paths):
+def generate_ast(ctx__):
     global ctx
     ctx = ctx__
 
-    start = time.clock()
+    start = time()
 
-    ast = get_ast_branch(ctx, paths)
+    ast = Ast_Branch()
+    ast.parent = None
+    stack = [(ast, [], -1, ctx.entry_addr, -1)]
+    visited = set()
+    waiting = {}
 
-    elapsed = time.clock()
+    ast_head = ast
+
+    fake_br = Ast_Branch()
+    fake_br.level = sys.maxsize
+
+    while stack or waiting:
+
+        if not stack and waiting:
+            if not ctx.gph.skipped_loops_analysis:
+                break
+            for ad in set(waiting):
+                waiting[ad].unseen.clear()
+                stack.append((fake_br, [], -1, ad, -1))
+
+        ast, loops_stack, prev, curr, else_addr = stack.pop(-1)
+
+        # Check if we enter in a false loop (see gotoinloop*)
+        if loops_stack:
+            _, _, l_start = loops_stack[-1]
+        else:
+            l_start = ctx.entry_addr
+
+        if (l_start, curr) in ctx.gph.false_loops:
+            continue
+
+        blk = ctx.gph.nodes[curr]
+
+        # Exit the current loop
+        while loops_stack:
+            l_ast, l_prev_loop, l_start = loops_stack[-1]
+            l_set = ctx.gph.loops_all[(l_prev_loop, l_start)]
+            if curr not in l_set:
+                loops_stack.pop(-1)
+                ast = l_ast.parent
+            else:
+                break
+
+        if not loops_stack:
+            l_prev_loop = -1
+            l_start = ctx.entry_addr
+            l_set = None
+
+        level = ast.level
+
+        if curr not in visited:
+            # Check if we need to stop and wait on a node
+            a = manage_endpoint(ctx, waiting, ast, prev, curr, l_set,
+                                l_prev_loop, l_start, True)
+            if a is None:
+                continue
+
+            ast = a
+            remove_unnecessary_goto(ast, curr)
+
+            # Check if we enter in a new loop
+            if (l_start, curr) in ctx.gph.loops_all:
+                name = "loop_0x%x" % curr
+                ctx.labels[name] = curr
+                ctx.reverse_labels[curr] = name
+                level += 1
+                a = Ast_Loop()
+                a.level = level
+                a.parent = ast
+                a.idx_in_parent = len(ast.nodes)
+                a.branch.parent = ast
+                a.branch.level = level
+                a.branch.idx_in_parent = len(ast.nodes)
+                ast.add(a)
+                ast = a.branch
+                loops_stack.append((a, l_start, curr))
+                else_addr = -1
+                l_ast = a
+                l_set = ctx.gph.loops_all[(l_start, curr)]
+                l_prev_loop = l_start
+                l_start = curr
+                if (l_prev_loop, l_start) in ctx.gph.infinite_loop:
+                    a.is_infinite = True
+            # Here curr may has changed
+
+        if curr in visited:
+            if curr == l_start:
+                continue
+            if len(ast.nodes) > 0:
+                if isinstance(ast.nodes[-1], list):
+                    prev = ast.nodes[-1][0].address
+                    if prev not in ctx.gph.uncond_jumps_set:
+                        ast.add(Ast_Goto(curr))
+            else:
+                ast.add(Ast_Goto(curr))
+            continue
+
+        visited.add(curr)
+
+        # Return instruction
+        if curr not in ctx.gph.link_out:
+            name = "ret_0x%x" % curr
+            ctx.labels[name] = curr
+            ctx.reverse_labels[curr] = name
+            ast.add(blk)
+            continue
+
+        nxt = ctx.gph.link_out[curr]
+
+        if curr in ctx.dis.jmptables:
+            ast.add(blk)
+            for n in nxt:
+                stack.append((ast, loops_stack, curr, n, else_addr))
+
+        elif len(nxt) == 2:
+            # We are on a conditional jump
+
+            prefetch = blk[1] if len(blk) == 2 else None
+
+            if loops_stack:
+                goto_set = False
+
+                c1 = nxt[BRANCH_NEXT] not in l_set
+                c2 = nxt[BRANCH_NEXT_JUMP] not in l_set
+
+                if c1 and c2:
+                    raise ExcIfelse(curr)
+
+                if c1:
+                    exit_loop = nxt[BRANCH_NEXT]
+                    nxt_node_in_loop = nxt[BRANCH_NEXT_JUMP]
+                    cond_id = ctx.libarch.utils.invert_cond(blk[0])
+                    goto_set = True
+
+                if c2:
+                    exit_loop = nxt[BRANCH_NEXT_JUMP]
+                    nxt_node_in_loop = nxt[BRANCH_NEXT]
+                    cond_id = ctx.libarch.utils.get_cond(blk[0])
+                    goto_set = True
+
+                # goto to exit a loop
+                if goto_set:
+                    stack.append((ast.parent, list(loops_stack), curr,
+                                  exit_loop, else_addr))
+                    stack.append((ast, list(loops_stack), curr,
+                                  nxt_node_in_loop, else_addr))
+                    a = Ast_IfGoto(blk[0], cond_id, exit_loop, prefetch)
+                    a.parent = ast
+                    a.level = level
+                    a.idx_in_parent = len(ast.nodes)
+                    ast.add(a)
+                    continue
+
+            # and-if
+            if ctx.print_andif:
+                if else_addr == nxt[BRANCH_NEXT_JUMP]:
+                    cond_id = ctx.libarch.utils.invert_cond(blk[0])
+                    a = Ast_AndIf(blk[0], cond_id, nxt[BRANCH_NEXT], prefetch)
+                    a.parent = ast
+                    a.idx_in_parent = len(ast.nodes)
+                    ast.add(a)
+                    ast.add(Ast_Goto(nxt[BRANCH_NEXT]))
+
+                    # Add a fake branch, with this in the manage function
+                    # all gotos to the else_addr will be invisible.
+                    stack.append((fake_br, list(loops_stack), curr,
+                                  nxt[BRANCH_NEXT_JUMP], else_addr))
+
+                    stack.append((ast, list(loops_stack), curr,
+                                  nxt[BRANCH_NEXT], else_addr))
+                    continue
+
+                # and-if
+                if else_addr == nxt[BRANCH_NEXT]:
+                    cond_id = ctx.libarch.utils.get_cond(blk[0])
+                    a = Ast_AndIf(blk[0], cond_id, nxt[BRANCH_NEXT_JUMP], prefetch)
+                    a.parent = ast
+                    a.idx_in_parent = len(ast.nodes)
+                    ast.add(a)
+                    ast.add(Ast_Goto(nxt[BRANCH_NEXT_JUMP]))
+
+                    stack.append((fake_br, list(loops_stack), curr,
+                                  nxt[BRANCH_NEXT], else_addr))
+
+                    stack.append((ast, list(loops_stack), curr,
+                                  nxt[BRANCH_NEXT_JUMP], else_addr))
+                    continue
+
+            # if-else
+
+            endpoint = search_endpoint(ctx, stack, ast, curr,
+                                       l_set, l_prev_loop, l_start)
+
+            ast_if = Ast_Branch()
+            ast_if.parent = ast
+            ast_if.level = level + 1
+            ast_if.idx_in_parent = len(ast.nodes)
+
+            ast_else = Ast_Branch()
+            ast_else.parent = ast
+            ast_else.level = level + 1
+            ast_else.idx_in_parent = len(ast.nodes)
+
+            else_addr = nxt[BRANCH_NEXT_JUMP]
+
+            if endpoint != -1:
+                if (l_start, endpoint) not in ctx.gph.false_loops:
+                    # If we have already seen this address (for example the
+                    # endpoint is the beginning of the current loop) we don't
+                    # re-add in the waiting list.
+                    if endpoint not in visited:
+                        manage_endpoint(ctx, waiting, ast, -1, endpoint, l_set,
+                                        l_prev_loop, l_start, False)
+                else:
+                    endpoint = -1
+
+            stack.append((ast_if, list(loops_stack), curr,
+                          nxt[BRANCH_NEXT], else_addr))
+
+            if endpoint == -1:
+                # No endpoint, so it's not useful to have an else-branch
+                # -> the stack will continue on `ast`
+                a = Ast_Ifelse(blk[0], ast_else, ast_if, else_addr, prefetch)
+                stack.append((ast, list(loops_stack), curr,
+                              nxt[BRANCH_NEXT_JUMP], else_addr))
+
+                a.parent = ast
+                a.level = level + 1
+                a.idx_in_parent = len(ast.nodes)
+                ast.add(a)
+                ast.add(Ast_Goto(else_addr))
+
+            elif endpoint == else_addr:
+                # Branch ast_else will be empty
+                a = Ast_Ifelse(blk[0], ast_else, ast_if, endpoint, prefetch)
+                stack.append((ast, list(loops_stack), curr,
+                              nxt[BRANCH_NEXT_JUMP], else_addr))
+
+                a.parent = ast
+                a.level = level + 1
+                a.idx_in_parent = len(ast.nodes)
+                ast.add(a)
+                ast.add(Ast_Goto(else_addr))
+
+            else:
+                a = Ast_Ifelse(blk[0], ast_else, ast_if, endpoint, prefetch)
+                stack.append((ast_else, list(loops_stack), curr,
+                              nxt[BRANCH_NEXT_JUMP], else_addr))
+
+                a.parent = ast
+                a.level = level + 1
+                a.idx_in_parent = len(ast.nodes)
+                ast.add(a)
+                ast.add(Ast_Goto(endpoint))
+
+        else:
+            ast.add(blk)
+            stack.append((ast, loops_stack, curr,
+                          nxt[BRANCH_NEXT], else_addr))
+
+    ast = ast_head
+
+    remove_all_unnecessary_goto(ast)
+    fix_non_consecutives(ctx, ast)
+
+    elapsed = time()
     elapsed = elapsed - start
     debug__("Ast generated in %fs" % elapsed)
 
     # Process ast
 
-    start = time.clock()
+    start = time()
 
     for func in ctx.libarch.registered:
         func(ctx, ast)
 
-    elapsed = time.clock()
+    elapsed = time()
     elapsed = elapsed - start
     debug__("Functions for processing ast in %fs" % elapsed)
 
     if ctx.color:
         ctx.libarch.process_ast.assign_colors(ctx, ast)
 
-    return ast
+    if waiting:
+        ast_head.nodes.insert(0, Ast_Comment(""))
+        ast_head.nodes.insert(0, Ast_Comment(""))
+        ast_head.nodes.insert(0,
+            Ast_Comment("WARNING: there is a bug, the output is incomplete !"))
+        ast_head.nodes.insert(0, Ast_Comment(""))
+        ast_head.nodes.insert(0, Ast_Comment(""))
+        return ast, False
+
+    return ast, True

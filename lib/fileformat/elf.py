@@ -17,10 +17,14 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
+import struct
+import bisect
+
 from elftools.elf.elffile import ELFFile
 from elftools.elf.constants import SH_FLAGS
 
-import lib.utils
+from lib.utils import warning
+from lib.fileformat.binary import SectionAbs, SYM_UNK, SYM_FUNC
 
 
 # SHF_WRITE=0x1
@@ -45,9 +49,6 @@ class ELF:
         fd = open(filename, "rb")
         self.elf = ELFFile(fd)
         self.classbinary = classbinary
-        self.__data_sections = []
-        self.__data_sections_content = []
-        self.__exec_sections = []
 
         self.arch_lookup = {
             "x86": CAPSTONE.CS_ARCH_X86,
@@ -66,76 +67,172 @@ class ELF:
             }
         }
 
+        self.sym_type_lookup = {
+            "STT_FUNC": SYM_FUNC,
+        }
+
+        self.__sections = {} # start address -> elf section
+
+        for s in self.elf.iter_sections():
+            if not s.name:
+                continue
+
+            start = s.header.sh_addr
+
+            if s.header.sh_flags & 0xf != 0:
+                bisect.insort_left(classbinary._sorted_sections, start)
+
+            self.__sections[start] = s
+            is_data = self.__section_is_data(s)
+            is_exec = self.__section_is_exec(s)
+
+            classbinary._abs_sections[start] = SectionAbs(
+                    s.name.decode(),
+                    start,
+                    s.header.sh_size,
+                    s.header.sh_size,
+                    is_exec,
+                    is_data,
+                    s.data())
+
+
+    def load_section_names(self):
+        # Used for the auto-completion
+        for s in self.elf.iter_sections():
+            if s.header.sh_flags & 0xf != 0:
+                ad = s.header.sh_addr
+                name = s.name.decode()
+                self.classbinary.section_names[name] = ad
+
 
     def load_static_sym(self):
         symtab = self.elf.get_section_by_name(b".symtab")
         if symtab is None:
             return
+        dont_save = [b"$a", b"$t", b"$d"]
+        arch = self.elf.get_machine_arch()
+        is_arm = arch == "ARM"
         for sy in symtab.iter_symbols():
-            if sy.entry.st_value != 0 and sy.name != b"":
-                self.classbinary.reverse_symbols[sy.entry.st_value] = sy.name.decode()
-                self.classbinary.symbols[sy.name.decode()] = sy.entry.st_value
-            # print("%x\t%s" % (sy.entry.st_value, sy.name.decode()))
+            if is_arm and sy.name in dont_save:
+                continue
+            ad = sy.entry.st_value
+            if ad != 0 and sy.name != b"":
+                name = sy.name.decode()
+                if name in self.classbinary.symbols:
+                    name = self.classbinary.rename_sym(name)
+                ty = self.sym_type_lookup.get(sy.entry.st_info.type, SYM_UNK)
+                self.classbinary.reverse_symbols[ad] = [name, ty]
+                self.classbinary.symbols[name] = [ad, ty]
+
+
+    def __x86_resolve_reloc(self, rel, symtab, plt, got_plt, addr_size):
+        # Save all got offsets with the corresponding symbol
+        got_off = {}
+        for r in rel.iter_relocations():
+            sym = symtab.get_symbol(r.entry.r_info_sym)
+            name = sym.name.decode()
+            ad = r.entry.r_offset
+            if name and ad:
+                ty = self.sym_type_lookup.get(sym.entry.st_info.type, SYM_UNK)
+                got_off[ad] = [name + "@plt", ty]
+
+        data = got_plt.data()
+
+        unpack_str = "<" if self.elf.little_endian else ">"
+        unpack_str += str(int(len(data) / addr_size))
+        unpack_str += "Q" if addr_size == 8 else "I"
+
+        got_values = struct.unpack(unpack_str, data)
+        plt_data = plt.data()
+        wrong_jump_opcode = False
+        off = got_plt.header.sh_addr
+
+        # Read the .got.plt and for each address in the plt, substract 6
+        # to go at the begining of the plt entry.
+
+        opcode_jmp = [b"\xff\x25", b"\xff\xa3"]
+
+        for jump_in_plt in got_values:
+            if off in got_off:
+                plt_start = jump_in_plt - 6
+                plt_off = plt_start - plt.header.sh_addr
+
+                # Check "jmp *(ADDR)" opcode.
+                if plt_data[plt_off:plt_off+2] not in opcode_jmp:
+                    wrong_jump_opcode = True
+                    continue
+
+                name, ty = got_off[off]
+                if name in self.classbinary.symbols:
+                    name = self.classbinary.rename_sym(name)
+
+                self.classbinary.reverse_symbols[plt_start] = (name, ty)
+                self.classbinary.symbols[name] = [plt_start, ty]
+
+            off += addr_size
+
+        if wrong_jump_opcode:
+            warning("I'm expecting to see a jmp *(ADDR) on each plt entry")
+            warning("opcode \\xff\\x25 was not found, please report")
+
+
+    def __resolve_symtab(self, rel, symtab):
+        # TODO: don't know why st_value is not 0 like x86
+        # In some executables I've tested, it seems that st_value
+        # is the address of the plt entry
+
+        # TODO: really useful to iter on relocations and get the symbol
+        # from the symtab ?
+        # for r in rel.iter_relocations():
+            # sym = symtab.get_symbol(r.entry.r_info_sym)
+
+        for sym in symtab.iter_symbols():
+            ad = sym.entry.st_value
+            if ad != 0:
+                name = sym.name.decode()
+                if name in self.classbinary.symbols:
+                    name = self.classbinary.rename_sym(name)
+                ty = self.sym_type_lookup.get(sym.entry.st_info.type, SYM_UNK)
+                self.classbinary.reverse_symbols[ad] = [name, ty]
+                self.classbinary.symbols[name] = [ad, ty]
+
+
+    def __iter_reloc(self):
+        for rel in self.elf.iter_sections():
+            if rel.header.sh_type in ["SHT_RELA", "SHT_REL"]:
+                symtab = self.elf.get_section(rel.header.sh_link)
+                if symtab is None:
+                    continue
+                yield (rel, symtab)
 
 
     def load_dyn_sym(self):
-        rel = (self.elf.get_section_by_name(b".rela.plt") or
-                self.elf.get_section_by_name(b".rel.plt"))
-        dyn = self.elf.get_section_by_name(b".dynsym")
-
-        if rel is None or dyn is None:
-            return
-
-        # TODO : are constants ?
-        PLT_SIZE = {
-            "x86": 16,
-            "x64": 16,
-            "ARM": 12,
-        }
-
-        PLT_FIRST_ENTRY_OFF = {
-            "x86": 16,
-            "x64": 16,
-            "ARM": 20,
-        }
-
         arch = self.elf.get_machine_arch()
 
-        if arch == "MIPS":
+        if arch == "ARM" or arch == "MIPS":
+            for (rel, symtab) in self.__iter_reloc():
+                self.__resolve_symtab(rel, symtab)
             return
 
-        relitems = list(rel.iter_relocations())
-        dynsym = list(dyn.iter_symbols())
+        # x86/x64
 
-        plt = self.elf.get_section_by_name(b".plt") 
-        plt_entry_size = PLT_SIZE[arch]
+        # TODO: .plt can be renamed ?
+        plt = self.elf.get_section_by_name(b".plt")
 
-        off = plt.header.sh_addr + PLT_FIRST_ENTRY_OFF[arch]
-        k = 0
+        if plt is None:
+            warning(".plt section not found")
+            return
 
-        while off < plt.header.sh_addr + plt.header.sh_size :
-            idx = relitems[k].entry.r_info_sym
-            name = dynsym[idx].name.decode()
-            self.classbinary.reverse_symbols[off] = name + "@plt"
-            self.classbinary.symbols[name + "@plt"] = off
-            off += plt_entry_size
-            k += 1
+        # TODO: .got.plt can be renamed or may be removed ?
+        got_plt = self.elf.get_section_by_name(b".got.plt")
+        addr_size = 8 if arch == "x64" else 4
 
+        if got_plt is None:
+            warning(".got.plt section not found")
+            return
 
-    def load_data_sections(self):
-        for s in self.elf.iter_sections():
-            if self.__section_is_data(s):
-                self.__data_sections.append(s)
-                self.__data_sections_content.append(s.data())
-
-
-    def __get_data_section_idx(self, addr):
-        for i, s in enumerate(self.__data_sections):
-            start = s.header.sh_addr
-            end = start + s.header.sh_size
-            if start <= addr < end:
-                return i
-        return -1
+        for (rel, symtab) in self.__iter_reloc():
+            self.__x86_resolve_reloc(rel, symtab, plt, got_plt, addr_size)
 
 
     def __section_is_data(self, s):
@@ -143,95 +240,21 @@ class ELF:
         return s.header.sh_flags & mask and not self.__section_is_exec(s)
 
 
-    def is_address(self, imm):
-        for s in self.elf.iter_sections():
-            start = s.header.sh_addr
-            if start == 0:
-                continue
-            end = start + s.header.sh_size
-            if  start <= imm < end:
-                return s.name.decode(), self.__section_is_data(s)
-        return None, False
-
-
-    def __get_cached_exec_section(self, addr):
-        for s in self.__exec_sections:
-            start = s.header.sh_addr
-            end = start + s.header.sh_size
-            if start <= addr < end:
-                return s
-        return None
-
-
-    def __find_section(self, addr):
-        for s in self.elf.iter_sections():
-            start = s.header.sh_addr
-            end = start + s.header.sh_size
-            if  start <= addr < end:
-                return s
-        return None
-
-
-    def __get_section(self, addr):
-        s = self.__get_cached_exec_section(addr)
-        if s is not None:
-            return s
-        s = self.__find_section(addr)
-        if s is None:
-            return None
-        self.__exec_sections.append(s)
-        return s
-
-
-    def check_addr(self, addr):
-        s = self.__get_section(addr)
-        return (s is not None, self.__section_is_exec(s))
-
-
-    def get_section_meta(self, addr):
-        s = self.__get_section(addr)
+    def __section_is_exec(self, s):
         if s is None:
             return 0
-        a = s.header.sh_addr
-        return s.name.decode(), a, a + s.header.sh_size - 1
+        return s.header.sh_flags & SH_FLAGS.SHF_EXECINSTR
 
 
     def section_stream_read(self, addr, size):
-        s = self.__get_section(addr)
+        s = self.classbinary.get_section(addr)
+        if s is None:
+            return b""
+        s = self.__sections[s.start]
         off = addr - s.header.sh_addr
         end = s.header.sh_addr + s.header.sh_size
         s.stream.seek(s.header.sh_offset + off)
         return s.stream.read(min(size, end - addr))
-
-
-    def __section_is_exec(self, s):
-        return s.header.sh_flags & SH_FLAGS.SHF_EXECINSTR
-
-
-    def get_string(self, addr, max_data_size):
-        i = self.__get_data_section_idx(addr)
-        if i == -1:
-            return ""
-
-        s = self.__data_sections[i]
-        data = self.__data_sections_content[i]
-        off = addr - s.header.sh_addr
-        txt = ['"']
-
-        i = 0
-        while i < max_data_size and \
-              off < s.header.sh_size:
-            c = data[off]
-            if c == 0:
-                break
-            txt.append(lib.utils.get_char(c))
-            off += 1
-            i += 1
-
-        if c != 0 and off != s.header.sh_size:
-            txt.append("...")
-
-        return ''.join(txt) + '"'
 
 
     def get_arch(self):
@@ -260,11 +283,3 @@ class ELF:
 
     def get_entry_point(self):
         return self.elf.header['e_entry']
-
-
-    def iter_sections(self):
-        for s in self.elf.iter_sections():
-            start = s.header.sh_addr
-            end = start + s.header.sh_size
-            if s.name != b"":
-                yield (s.name.decode(), start, end)

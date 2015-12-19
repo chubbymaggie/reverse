@@ -18,10 +18,12 @@
 #
 
 import os
-import time
+from time import time
 
-from lib.paths import Paths
-from lib.utils import BRANCH_NEXT, BRANCH_NEXT_JUMP, index, debug__
+from lib.utils import BRANCH_NEXT, BRANCH_NEXT_JUMP, debug__, list_starts_with
+
+# For the loop's analysis
+MAX_NODES = 800
 
 
 class Graph:
@@ -40,74 +42,73 @@ class Graph:
 
         self.entry_point_addr = entry_point_addr
         self.dis = dis
-        self.loops = []
-        self.loops_set = []
-        self.nested_loops_idx = {}
-        self.direct_nested_idx = {}
+
+        # For one loop : contains all address of the loop only
+        self.loops_set = {}
+
+        # For one loop : contains all address of the loop and sub-loops
+        self.loops_all = {}
+
+        # Rest of all address which are not in a loop
+        self.not_in_loop = set()
+
+        self.loops_start = set()
 
         # Optimization
         self.cond_jumps_set = set()
         self.uncond_jumps_set = set()
 
-        # If a loop is "marked" it means that there is an other equivalent
-        # loop, and this must not be interpreted during the process. Generally
-        # it will print a jmp. This can occurs if a goto jump inside a loop.
-        self.marked = set()
+        self.equiv = {}
+        self.false_loops = set()
 
-        # address juste before the loop marked
-        self.marked_addr = set()
+        # Loop dependencies
+        self.deps = {}
+        self.rev_deps = {}
 
-        self.__key_path_count = 0
+        self.cache_path_exists = {}
 
+        # For each loop we search the last node that if we enter in it,
+        # we are sure to return to the loop.
+        self.last_loop_node = {}
 
-    def add_node(self, inst):
-        self.nodes[inst.address] = [inst]
+        self.all_deep_equiv = set()
 
-
-    def set_next(self, curr, inst):
-        self.nodes[curr.address] = [curr]
-        self.link_out[curr.address] = [inst.address]
-        if inst.address not in self.link_in:
-            self.link_in[inst.address] = []
-        self.link_in[inst.address].append(curr.address)
+        self.skipped_loops_analysis = False
 
 
-    def set_cond_next(self, curr, next_jump, direct_next):
-        self.nodes[curr.address] = [curr]
-        self.link_out[curr.address] = [direct_next.address, next_jump.address]
+    # A jump is normally alone in a block, but for some architectures
+    # we save the prefetched instruction after.
 
-        if next_jump.address not in self.link_in:
-            self.link_in[next_jump.address] = []
+    def new_node(self, curr, prefetch, nxt):
+        ad = curr.address
+        self.nodes[ad] = [curr]
 
-        if direct_next.address not in self.link_in:
-            self.link_in[direct_next.address] = []
+        if nxt is not None:
+            self.link_out[ad] = nxt
 
-        self.link_in[next_jump.address].append(curr.address)
-        self.link_in[direct_next.address].append(curr.address)
+        if nxt is not None:
+            for n in nxt:
+                if n not in self.link_in:
+                    self.link_in[n] = [ad]
+                else:
+                    self.link_in[n].append(ad)
+
+        if prefetch is not None:
+            self.nodes[ad].append(prefetch)
 
 
     def exists(self, inst):
         return inst.address in self.nodes
 
 
-    def get_paths(self):
-        self.__simplify()
-        paths = self.__explore(self.entry_point_addr)
-        self.__search_equivalent_loops(paths)
-        self.__compute_nested()
-        return paths
-
-
     # Concat instructions in single block
     # jumps are in separated blocks
-    def __simplify(self):
-        ARCH_UTILS = self.dis.load_arch_module().utils
+    def simplify(self):
         nodes = list(self.nodes.keys())
-        start = time.clock()
+        start = time()
 
         for ad in nodes:
-            inst = self.nodes[ad]
-            if ARCH_UTILS.is_jump(inst[0]):
+            if ad in self.uncond_jumps_set or ad in self.cond_jumps_set:
                 continue
 
             if ad not in self.link_in or len(self.link_in[ad]) != 1 or \
@@ -117,7 +118,7 @@ class Graph:
             pred = self.link_in[ad][0]
 
             # don't fuse with jumps
-            if ARCH_UTILS.is_jump(self.nodes[pred][0]):
+            if pred in self.uncond_jumps_set or pred in self.cond_jumps_set:
                 continue
 
             if pred not in self.link_out or len(self.link_out[pred]) != 1:
@@ -138,226 +139,705 @@ class Graph:
 
             # replace all addr wich refers to ad
             for k, lst_i in self.link_in.items():
-                try:
+                if ad in lst_i:
                     lst_i[lst_i.index(ad)] = pred
-                except ValueError:
-                    pass
 
-        elapsed = time.clock()
+        elapsed = time()
         elapsed = elapsed - start
-        debug__("Graph simplified in %fs" % elapsed)
+        debug__("Graph simplified in %fs (%d nodes)" % (elapsed, len(self.nodes)))
 
 
-    # Check d3/index.html !
-    def html_graph(self):
-        revpath = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
-        output = open(revpath + "/../d3/graph.js", "w+")
-        output.write("mygraph = \"digraph {\\\n")
+    def dot_loop_deps(self):
+        output = open("graph_loop_deps.dot", "w+")
+        output.write('digraph {\n')
+        output.write('node [fontname="liberation mono" style=filled fillcolor=white shape=box];\n')
 
-        for k, lst_i in self.nodes.items():
-            output.write("node_%x [label=\\\"" % k)
+        for k, dp in self.deps.items():
+            output.write('node_%x_%x [label="(%x, %x)"' % (k[0], k[1], k[0], k[1]))
+
+            if k in self.false_loops:
+                output.write(' fillcolor="#B6FFDD"')
+
+            if k in self.all_deep_equiv:
+                output.write(' color="#ff0000"')
+
+            output.write('];\n')
+
+            for sub in dp:
+                output.write('node_%x_%x -> node_%x_%x;\n'
+                        % (k[0], k[1], sub[0], sub[1]))
+
+        output.write('}\n')
+        output.close()
+
+
+    def dot_graph(self, jmptables):
+        output = open("graph.dot", "w+")
+        output.write('digraph {\n')
+        # output.write('graph [bgcolor="#aaaaaa" pad=20];\n')
+        # output.write('node [fontname="liberation mono" style=filled fillcolor="#333333" fontcolor="#d3d3d3" shape=box];\n')
+        output.write('node [fontname="liberation mono" style=filled fillcolor=white shape=box];\n')
+
+        keys = list(self.nodes.keys())
+        keys.sort()
+
+        for k in keys:
+            lst_i = self.nodes[k]
+
+            output.write('node_%x [label="' % k)
 
             for i in lst_i:
-                output.write("0x%x: %s %s\\n" % (i.address, i.mnemonic, i.op_str))
+                output.write('0x%x: %s %s\\l' % (i.address, i.mnemonic, i.op_str))
 
-            output.write("\\\"")
+            output.write('"')
 
-            if k not in self.link_out:
-                output.write(" style=\\\"fill:#f77\\\"")
+            if k in self.loops_start:
+                output.write(' fillcolor="#FFFCC4"')
+            elif k not in self.link_out:
+                output.write(' fillcolor="#ff7777"')
             elif k not in self.link_in:
-                output.write(" style=\\\"fill:#B6FFDD\\\"")
+                output.write(' fillcolor="#B6FFDD"')
 
-            output.write("];\\\n")
+            output.write('];\n')
         
         for k, i in self.link_out.items():
-            if len(i) == 2:
+            if k in jmptables:
+                for ad in jmptables[k].table:
+                    output.write('node_%x -> node_%x;\n' % (k, ad))
+            elif len(i) == 2:
                 # true green branch (jump is taken)
-                output.write("node_%x -> node_%x [" % (k, i[BRANCH_NEXT_JUMP]))
-                output.write("style=\\\"stroke: #58DA9C; stroke-width: 3px;\\\" ")
-                output.write("arrowheadStyle=\\\"fill: #58DA9C\\\"")
-                output.write("];\\\n")
+                output.write('node_%x -> node_%x [color="#58DA9C"];\n'
+                        % (k, i[BRANCH_NEXT_JUMP]))
 
                 # false red branch (jump is not taken)
-                output.write("node_%x -> node_%x [" % (k, i[BRANCH_NEXT]))
-                output.write("style=\\\"stroke: #f77; stroke-width: 3px;\\\" ")
-                output.write("arrowheadStyle=\\\"fill: #f77\\\"")
-                output.write("];\\\n")
-
+                output.write('node_%x -> node_%x [color="#ff7777"];\n'
+                        % (k, i[BRANCH_NEXT]))
             else:
-                output.write("node_%x -> node_%x;\\\n" % (k, i[BRANCH_NEXT]))
+                output.write('node_%x -> node_%x;\n' % (k, i[BRANCH_NEXT]))
 
-        output.write("}\";\n")
-        output.write("inputGraph.innerHTML = mygraph;")
-        output.write("tryDraw();")
+        output.write('}')
+        output.close()
 
 
-    def __rec_explore(self, paths, p, new):
-        myk = self.__key_path_count
-        self.__key_path_count += 1
-        paths.paths[myk] = p
-        p_set = set(p) # optimization search
+    def __search_last_loop_node(self, visited, l_prev_loop, l_start, l_set):
+        def __rec_search(ad):
+            for prev in self.link_in[ad]:
+                nxt = self.link_out[prev]
+                for n in nxt:
+                    if n not in l_set:
+                        if ad not in self.last_loop_node:
+                            self.last_loop_node[ad] = set()
+                        self.last_loop_node[ad].add((l_prev_loop, l_start))
+                        return
 
-        while new in self.link_out:
-            if new in p_set:
-                # loop detected
-                idx_node = p.index(new)
-                l = p[idx_node:]
-                l_idx = index(self.loops, l)
-
-                if l_idx == -1:
-                    l_idx = len(self.loops)
-                    self.loops.append(l)
-                    self.loops_set.append(set(l))
-
-                paths.looping[myk] = l_idx
+            if ad in visited:
                 return
 
-            else:
-                p.append(new)
-                p_set.add(new)
-                nxt = self.link_out[new]
+            visited.add(ad)
 
-                # much faster than: is_cond_jump(self.dis.code[new])
-                if len(nxt) == 2:
-                    self.__rec_explore(paths, list(p), nxt[BRANCH_NEXT_JUMP])
+            for prev in self.link_in[ad]:
+                __rec_search(prev)
 
-                new = nxt[BRANCH_NEXT]
-
-        p.append(new)
-
-
-    def __explore(self, entry):
-        paths = Paths()
-        start = time.clock()
-        self.__rec_explore(paths, [], entry)
-        elapsed = time.clock()
-        elapsed = elapsed - start
-        debug__("Exploration: found %d paths and %d loop-paths in %fs" %
-                (len(paths.paths), len(paths.looping), elapsed))
-        return paths
+        # start from the end of the loop
+        ad = l_start
+        visited.add(ad)
+        for prev in self.link_in[l_start]:
+            if prev in l_set:
+                __rec_search(prev)
 
 
-    def __compute_nested(self):
-        start = time.clock()
+    def __is_inf_loop(self, l_set):
+        for ad in l_set:
+            if ad in self.link_out:
+                for nxt in self.link_out[ad]:
+                    if nxt not in l_set:
+                        return False
+        return True
 
-        for k in range(len(self.loops)):
-            self.nested_loops_idx[k] = set()
-            self.direct_nested_idx[k] = set()
 
-        has_parent_loop_idx = set()
 
-        for k, l in enumerate(self.loops):
-            self.nested_loops_idx[k] = set()
-            self.direct_nested_idx[k] = set()
 
-        for k1, l1 in enumerate(self.loops):
-            if k1 in self.marked:
+
+    def path_exists(self, from_addr, to_addr):
+        def __rec_path_exists(curr, local_visited):
+            stack = [curr]
+            while stack:
+                curr = stack.pop(-1)
+                if curr == to_addr:
+                    return True
+                if curr in local_visited:
+                    continue
+                local_visited.add(curr)
+                if curr not in self.link_out:
+                    continue
+                for n in self.link_out[curr]:
+                    stack.append(n)
+            return False
+
+        if (from_addr, to_addr) in self.cache_path_exists:
+            return self.cache_path_exists[(from_addr, to_addr)]
+
+        local_visited = set()
+        res = __rec_path_exists(from_addr, local_visited)
+        self.cache_path_exists[(from_addr, to_addr)] = res
+        return res
+
+
+    # Returns a set containing every address which are in paths from
+    # 'from_addr' to 'to_addr'.
+    def find_paths(self, from_addr, to_addr, global_visited):
+        def __rec_find_paths(curr, local_visited, path_set):
+            nonlocal isfirst
+
+            if curr == to_addr and not isfirst:
+                path_set.add(curr)
+                return
+
+            isfirst = False
+
+            if curr in local_visited:
+                return
+
+            local_visited.add(curr)
+
+            if curr in global_visited or curr not in self.link_out:
+                return
+
+            for n in self.link_out[curr]:
+                __rec_find_paths(n, local_visited, path_set)
+
+                if n in path_set:
+                    path_set.add(curr)
+
+        isfirst = True
+        path_set = set()
+        local_visited = set()
+        __rec_find_paths(from_addr, local_visited, path_set)
+        return path_set
+
+
+    def __try_find_loops(self, entry, waiting, par_loops, l_set, is_sub_loop):
+        detected_loops = {}
+        keys = set(waiting.keys())
+
+        for ad in keys:
+            if l_set is not None and ad not in l_set:
                 continue
-            for addr in l1[1:]:
-                # check if addr is a beginning of another loop
-                # found = -1
-                for k2, l2 in enumerate(self.loops):
-                    if k2 in self.marked or \
-                            self.loops_set[k1] == self.loops_set[k2]:
-                        continue
-                    if l2[0] == addr:
-                        self.direct_nested_idx[k1].add(k2) 
-                        self.nested_loops_idx[k1].add(k2) 
-                        has_parent_loop_idx.add(k2)
 
-        # Warning : sometimes a sub-nested-loop didn't appear in a
-        # parent-parent-loop. So we search for new nested.
-        # See tests/nestedloop5 :
-        # the path of the third loop is not in the first one
+            if (entry, ad) in self.loops_set:
+                continue
+
+            l = self.find_paths(ad, ad, par_loops)
+
+            # If the set is empty, it's not a loop
+            if l:
+                self.loops_set[(entry, ad)] = l
+                is_sub_loop.add(ad)
+                detected_loops[ad] = (entry, ad)
+
+        return detected_loops
+
+
+    def __manage_waiting(self, stack, visited, waiting, l_set, done):
+        keys = set(waiting.keys())
+        for ad in keys:
+            if l_set is not None and ad not in l_set:
+                continue
+            if len(waiting[ad]) == 0:
+                del waiting[ad]
+                done.add(ad)
+                stack.append((-1, ad))
+
+
+    def __until_stack_empty(self, stack, waiting, visited,
+                            par_loops, l_set, is_sub_loop, done):
+        has_moved = False
+
+        while stack:
+            prev, ad = stack.pop(-1)
+
+            if ad in self.link_in and ad not in done:
+                l_in = self.link_in[ad]
+
+                if len(l_in) > 1 or l_set is not None and ad not in l_set:
+                    if ad in waiting:
+                        if prev in waiting[ad]:
+                            waiting[ad].remove(prev)
+                    else:
+                        unseen = set(l_in)
+                        unseen.remove(prev)
+                        waiting[ad] = unseen
+                    continue
+
+            if ad in visited:
+                continue
+
+            visited.add(ad)
+
+            if ad in self.link_out:
+                for n in self.link_out[ad]:
+                    if n in par_loops:
+                        continue
+                    stack.append((ad, n))
+                    has_moved = True
+
+        return has_moved
+
+
+    def __get_new_loops(self, waiting, detected_loops, l_set, is_sub_loop):
+        new_loops = set()
+
+        # Remove internal links to the beginning of the loop
+        # If later we enter in the loop it means that len(waiting[ad]) == 0
+        for ad, k in detected_loops.items():
+            loop = self.loops_set[k]
+
+            was_removed = False
+
+            for rest in set(waiting[ad]):
+                if rest in loop:
+                    waiting[ad].remove(rest)
+                    was_removed = True
+
+            if was_removed:
+                if len(waiting[ad]) == 0:
+                    new_loops.add(ad)
+                    del waiting[ad]
+
+        # Remove external jumps which are outside the current loop
+        for ad, unseen in waiting.items():
+            if l_set is not None and ad not in l_set:
+                continue
+            for i in set(unseen):
+                if l_set is not None and i not in l_set:
+                    unseen.remove(i)
+
+        return new_loops
+
+
+    def __explore(self, entry, par_loops, visited, waiting, l_set, done):
+        stack = []
+
+        # Check if the first address (entry point of the function) is the
+        # beginning of a loop.
+        if not visited and entry in self.link_in:
+            for p in self.link_in[entry]:
+                stack.append((p, entry))
+        else:
+            if entry in self.link_out:
+                for n in self.link_out[entry]:
+                    stack.append((entry, n))
+            visited.add(entry)
+
+        is_sub_loop = set()
 
         while 1:
-            moved = False
-            for parent in self.nested_loops_idx:
-                l_par = self.nested_loops_idx[parent]
-                for nest in list(l_par):
-                    for subnest in self.nested_loops_idx[nest]:
-                        if subnest not in l_par:
-                            l_par.add(subnest)
-                            has_parent_loop_idx.add(subnest)
-                            moved = True
-            if not moved:
+            if self.__until_stack_empty(
+                    stack, waiting, visited, par_loops, l_set, is_sub_loop, done):
+                self.__manage_waiting(stack, visited, waiting, l_set, done)
+                continue
+
+            detected_loops = self.__try_find_loops(
+                    entry, waiting, par_loops, l_set, is_sub_loop)
+
+            new_loops = self.__get_new_loops(
+                    waiting, detected_loops, l_set, is_sub_loop)
+
+            while new_loops:
+                # Follow loops
+                for ad in new_loops:
+                    # TODO : optimize
+                    v = set(visited)
+                    v.add(ad)
+                    pl = set(par_loops)
+                    pl.add(ad)
+
+                    l = self.loops_set[(entry, ad)]
+                    self.__explore(ad, pl, v, waiting, l, set(done))
+
+                detected_loops = self.__try_find_loops(
+                        entry, waiting, par_loops, l_set, is_sub_loop)
+
+                new_loops = self.__get_new_loops(
+                        waiting, detected_loops, l_set, is_sub_loop)
+
+
+            self.__manage_waiting(stack, visited, waiting, l_set, done)
+
+            if not stack:
                 break
 
-        self.direct_nested_idx[-1] = set(range(len(self.loops))) - has_parent_loop_idx
-        self.nested_loops_idx[-1] = set(range(len(self.loops)))
+        # Now for each current loop, we add the content of each sub-loops.
+        # It means that a loop contains all sub-loops (which is not the case
+        # in loops_set : in contains only the current loop).
+        for ad in is_sub_loop:
+            loop = set(self.loops_set[(entry, ad)])
+            self.loops_all[(entry, ad)] = loop
 
-        elapsed = time.clock()
-        elapsed = elapsed - start
-        debug__("Nested loops computed in %fs" % elapsed)
+            self.deps[(entry, ad)] = set()
+
+            for (prev, start), l in self.loops_set.items():
+                # Skip current loop
+                if (prev, start) == (entry, ad):
+                    continue
+
+                # Is it a sub loop ?
+                if prev == ad and start != entry and start in loop:
+                    k1 = (entry, ad)
+                    k2 = (prev, start)
+                    if k2 not in self.rev_deps:
+                        self.rev_deps[k2] = set()
+                    self.rev_deps[k2].add(k1)
+                    self.deps[k1].add(k2)
+                    self.loops_all[(entry, ad)].update(self.loops_all[(prev, start)])
 
 
-    def __search_equivalent_loops(self, paths):
-        # TODO : temporary algorithm while waiting a better one.
+    def all_false(self, loops_key):
+        for k in loops_key:
+            if k not in self.false_loops:
+                return False
+        return True
+
+
+    # Mark recursively parent loops
+    def __rec_mark_parent_false(self, k):
+        self.false_loops.add(k)
+        if k not in self.rev_deps:
+            return
+
+        for par in self.rev_deps[k]:
+            if par in self.false_loops:
+                continue
+
+            if self.all_false(self.deps[par]):
+                self.__rec_mark_parent_false(par)
+
+
+    # Mark recursively sub loops
+    def __rec_mark_sub_false(self, k):
+        self.false_loops.add(k)
+        for sub in self.deps[k]:
+            if sub in self.false_loops:
+                continue
+            self.__rec_mark_sub_false(sub)
+
+
+    def __yield_cmp_loops(self, keys1, not_in_false=True):
+        # optim: don't compare twice two loops
+        keys2 = set(keys1)
+        for k1 in keys1:
+            keys2.remove(k1)
+            if not_in_false and k1 in self.false_loops:
+                continue
+            for k2 in keys2:
+                if not_in_false and k2 in self.false_loops:
+                    continue
+                yield k1, k2
+
+
+    def __search_false_loops(self):
         #
-        # Can occurs when a goto jumps into a loop. This will generate more
-        # loops. For example :
+        # Try to detect "strange" loops:
+        #
+        # example :
         #
         # if {
-        #    goto next
-        # }
-        # 
-        # loop {
-        #    next:
-        #    ...
+        #   goto label
         # }
         #
-        # Two loops are detected here, but they are equivalents, one is just
-        # shifted. If each number is an address we can have for example these
-        # two loops :
-        # [1, 2, 3, 4, 5]
-        # [2, 3, 4, 5, 6]
+        # while {
+        #   if {
+        #     statement_1
+        # label:
+        #     statement_2
+        #   } else {
+        #     statement_3
+        #   }
+        # }
         #
-        #
-        # So to keep only the non-shifted loop, we keep the loop which have
-        # the smallest address at the beginning (here 1).
-        #
-        # In fact it's false, because sometimes we can have this situation
-        # For avoiding these we had a jmp for to be sure (see tests/gotoinloop3)
+        # Check for example gotoinloop6 to see the result.
         #
 
-        self.equiv = {}
+        for (prev1, start1), (prev2, start2) in \
+                    self.__yield_cmp_loops(self.loops_all.keys()):
+            l1 = self.loops_set[(prev1, start1)]
+            l2 = self.loops_set[(prev2, start2)]
 
-        for k1, l1 in enumerate(self.loops_set):
-            k2 = k1 + 1
-            while k2 < len(self.loops_set):
-                l2 = self.loops_set[k2]
-                if l1 == l2:
-                    k = k1 if self.loops[k1][0] < self.loops[k2][0] else k2
-                    self.marked.add(k)
-                    self.__mark_addr(paths, k)
-                    self.equiv[k1] = k2
-                    self.equiv[k2] = k1
-                k2 += 1
+            if prev2 in l1 and \
+               start2 in l1 and \
+               start1 in l2:
+                if l2.issubset(l1):
+                    self.__rec_mark_parent_false((prev2, start2))
+                    self.__rec_mark_sub_false((prev2, start2))
 
-        # print(self.marked)
-        # print_set(self.marked_addr)
-
-
-    def __mark_addr(self, paths, loop_idx):
-        for k in paths.looping:
-            if paths.looping[k] == loop_idx:
-                idx_start_loop = paths.paths[k].index(self.loops[loop_idx][0])
-                before = paths.paths[k][idx_start_loop-1]
-                self.marked_addr.add(before)
+            elif prev1 in l2 and \
+                 start1 in l2 and \
+                 start2 in l1:
+                if l1.issubset(l2):
+                    self.__rec_mark_parent_false((prev1, start1))
+                    self.__rec_mark_sub_false((prev1, start1))
 
 
-    def __get_loop_set(self, k):
-        s = self.loops_set[k]
-        for i in self.nested_loops_idx[k]:
-            s.update(self.loops_set[i])
-        return s
+    def __search_same_deep_equiv_loops(self):
+        #
+        # Search equivalent loops at the same deep, but compare with
+        # 'loops_all' -> each item contains all sub-loops instead of
+        # 'loops_set' wich contains only the loop.
+        #
+        # example:
+        #
+        #      loop1
+        #     /     \
+        #  loop2   loop3
+        #
+        # If loops_all[loop2] == loops_all[loop3], and if loop2 or loop3 is
+        # in false_loops, we removed these loops.
+        #
+
+        def do_add(k1, k2):
+            nonlocal idx_count, set_index, deep_equiv
+            l1 = self.loops_all[k1]
+            l2 = self.loops_all[k2]
+            if l1 == l2:
+                if k1 in set_index:
+                    i = set_index[k1]
+                    deep_equiv[i].add(k2)
+                    self.all_deep_equiv.add(k2)
+                    set_index[k2] = i
+                elif k2 in set_index:
+                    i = set_index[k2]
+                    deep_equiv[i].add(k1)
+                    self.all_deep_equiv.add(k1)
+                    set_index[k1] = i
+                else:
+                    i = idx_count
+                    idx_count += 1
+                    deep_equiv[i] = {k1, k2}
+                    set_index[k1] = i
+                    set_index[k2] = i
+                    self.all_deep_equiv.add(k1)
+                    self.all_deep_equiv.add(k2)
+
+        set_index = {}
+        deep_equiv = {}
+        idx_count = 0
+
+        for k in self.deps:
+            for k1, k2 in self.__yield_cmp_loops(self.deps[k], False):
+                do_add(k1, k2)
+
+        for k1, k2 in self.__yield_cmp_loops(self.roots, False):
+            do_add(k1, k2)
+
+        if not deep_equiv:
+            return
+
+        last_length = 0
+        while last_length != len(self.false_loops):
+            last_length = len(self.false_loops)
+
+            for i, keys in deep_equiv.items():
+                nb_false = 0
+                for k in keys:
+                    if k in self.false_loops:
+                        nb_false += 1
+
+                if nb_false > 0:
+                    for k in set(keys):
+                        if k in self.false_loops:
+                            continue
+                        subs = self.deps[k]
+                        if len(subs) == 0 or self.all_false(subs):
+                            keys.remove(k)
+                            self.__rec_mark_parent_false(k)
 
 
-    def __contains_nested(self, k):
-        return len(self.nested_loops_idx[k]) != 0
+    def __prune_loops(self):
+        def set_paths(k, p):
+            nonlocal deps, loop_paths
+            loop_paths[k].append(p)
+            i = 0
+            for sub in deps[k]:
+                set_paths(sub, p + [i])
+                i += 1
+
+        #
+        # Create loop paths
+        # example:
+        #
+        #     loop1
+        #    /     \
+        # loop2   loop3
+        #
+        # paths:
+        # loop1 = [0]
+        # loop2 = [0, 0]
+        # loop3 = [0, 1]
+        #
+
+        deps = self.deps
+        loop_paths = {}
+
+        for k in deps:
+            deps[k] = list(deps[k])
+            loop_paths[k] = []
+
+        i = 0
+        for k in self.roots:
+            set_paths(k, [i])
+            i += 1
+
+        # If there are more than one path for a loop, it means
+        # that a loop has more than one parent. The goal is to
+        # determine which parent is "wrong". If there is two parents
+        # we can't say anything.
+
+        prefix_to_remove = []
+
+        for k, paths in loop_paths.items():
+
+            if len(paths) > 2:
+                stop_at_first_diff = False
+                i = 0
+                prefix = []
+
+                while not stop_at_first_diff:
+                    count = {}
+                    for p in paths:
+                        curr = p[i]
+                        if curr in count:
+                            count[curr] += 1
+                        else:
+                            count[curr] = 1
+
+                    if len(count) > 1:
+                        # Keep only the parent loop which has only one reference
+                        # to this loop (and ONLY this loop must have ONLY ONE
+                        # reference).
+
+                        n = 0
+                        for idx, c in count.items():
+                            if c == 1:
+                                n += 1
+
+                        if n == 1:
+                            # Remove all others loops
+                            for loop_idx, c in count.items():
+                                if c != 1:
+                                    prefix.append(loop_idx)
+
+                                    if prefix not in prefix_to_remove:
+                                        prefix_to_remove.append(prefix)
+
+                        stop_at_first_diff = True
+
+                    else:
+                        # here len(count) == 1
+                        prefix.append(curr)
+
+                    i += 1
+
+        # Remove all loops which start with these prefix
+
+        # if prefix_to_remove:
+            # debug__(loop_paths)
+            # for prefix in prefix_to_remove:
+                # debug__("prune %s" % repr(prefix))
 
 
-    def __are_equiv(self, k1, k2):
-        s1 = self.__get_loop_set(k1)
-        s2 = self.__get_loop_set(k2)
-        return s1 == s2
+        for k, paths in loop_paths.items():
+            if k in self.false_loops:
+                continue
+
+            all_matches = True
+
+            for p in paths:
+                one_match = False
+                for prefix in prefix_to_remove:
+                    if list_starts_with(p, prefix):
+                        one_match = True
+                        break
+
+                if not one_match:
+                    all_matches = False
+                    break
+
+            if all_matches:
+                self.false_loops.add(k)
+
+
+    def __update_loops(self):
+        def rec_remove(k):
+            if k not in self.loops_all:
+                return
+            del self.loops_all[k]
+            del self.loops_set[k]
+            for sub in self.deps[k]:
+                if sub in self.false_loops:
+                    rec_remove(sub)
+        for k in self.false_loops:
+            if k not in self.rev_deps or k in self.all_deep_equiv:
+                rec_remove(k)
+
+
+    def loop_detection(self, ctx, entry, bypass_false_search=False):
+        start = time()
+
+        # Equivalent loops at a same deep in the loops dependencies tree
+        self.deep_equiv = set()
+        # For one loop : contains all address of the loop only
+        self.loops_set = {}
+        # For one loop : contains all address of the loop and sub-loops
+        self.loops_all = {}
+        # Loop dependencies
+        self.deps = {}
+        self.rev_deps = {}
+        # Loops marked as "False"
+        self.false_loops = set()
+
+        if len(self.nodes) > MAX_NODES:
+            self.skipped_loops_analysis = True
+            return
+
+        self.__explore(entry, set(), set(), {}, None, set())
+
+        self.roots = self.loops_set.keys() - self.rev_deps.keys()
+
+        self.__prune_loops()
+
+        if not bypass_false_search:
+            self.__search_false_loops()
+            self.__search_same_deep_equiv_loops()
+
+        self.__update_loops()
+
+        # Compute all address which are not in a loop
+        in_loop = set()
+        for l in self.loops_set.items():
+            in_loop.update(l[1])
+
+        # Rest of all address which are not in a loop
+        self.not_in_loop = self.nodes.keys() - in_loop
+
+        # Search inifinite loops
+        self.infinite_loop = set()
+        for l_curr_loop, l_set in self.loops_all.items():
+            if self.__is_inf_loop(l_set):
+                self.infinite_loop.add(l_curr_loop)
+
+        # Save first address of loops
+        self.loops_start = set()
+        for _, l_start in self.loops_all:
+            self.loops_start.add(l_start)
+
+        # For each loop we search the last node that if we enter in it,
+        # we are sure to return to the loop.
+        self.last_loop_node = {}
+        for (l_prev_loop, l_start), l_set in self.loops_all.items():
+            self.last_loop_node[(l_prev_loop, l_start)] = set()
+            self.__search_last_loop_node(set(), l_prev_loop, l_start, l_set)
+
+        elapsed = time()
+        elapsed = elapsed - start
+        debug__("Exploration: found %d loop(s) in %fs" %
+                (len(self.loops_all), elapsed))

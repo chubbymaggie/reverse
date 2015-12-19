@@ -18,14 +18,12 @@
 #
 
 
-from lib.colors import color_addr, color_keyword
-from lib.output import (print_comment, print_no_end, print_tabbed,
-        print_tabbed_no_end)
-
-
 class Ast_Branch:
     def __init__(self):
         self.nodes = []
+        self.parent = None
+        self.level = 0
+        self.idx_in_parent = -1 # index in nodes list in the parent branch
 
     def add(self, node):
         if isinstance(node, Ast_Branch):
@@ -33,40 +31,55 @@ class Ast_Branch:
         else:
             self.nodes.append(node)
 
-    def print(self, o, tab=0):
+    def dump(self, o, tab=0):
         for n in self.nodes:
             if isinstance(n, list):
-                o.print_block(n, tab)
+                o._asm_block(n, tab)
             else: # ast
-                n.print(o, tab)
+                n.dump(o, tab)
 
 
 class Ast_IfGoto:
-    def __init__(self, orig_jump, cond_id, addr_jump):
+    def __init__(self, orig_jump, cond_id, addr_jump, prefetch=None):
         self.orig_jump = orig_jump
         self.cond_id = cond_id
         self.addr_jump = addr_jump
         self.fused_inst = None
+        self.prefetch = prefetch
+        self.parent = None
+        self.level = 0
 
-    def print(self, o, tab=0):
-        o.print_commented_jump(self.orig_jump, self.fused_inst, tab)
-        print_tabbed_no_end(color_keyword("if "), tab)
-        o.print_if_cond(self.cond_id, self.fused_inst)
-        print_no_end(color_keyword("  goto "))
-        print(color_addr(self.addr_jump, False))
+    def dump(self, o, tab=0):
+        o._comment_fused(self.orig_jump, self.fused_inst, tab)
+        if self.prefetch is not None:
+            o._asm_inst(self.prefetch, tab)
+        o._tabs(tab)
+        o._keyword("if ")
+        o._if_cond(self.cond_id, self.fused_inst)
+        o._keyword("  goto ")
+        o._label_or_address(self.addr_jump, -1, False)
+        o._new_line()
 
 
 class Ast_AndIf:
-    def __init__(self, orig_jump, cond_id):
+    def __init__(self, orig_jump, cond_id, expected_next_addr, prefetch=None):
         self.orig_jump = orig_jump
         self.cond_id = cond_id
         self.fused_inst = None
+        self.prefetch = prefetch
+        self.parent = None
+        self.level = 0
+        self.expected_next_addr = expected_next_addr
 
-    def print(self, o, tab=0):
-        o.print_commented_jump(self.orig_jump, self.fused_inst, tab)
-        print_tabbed_no_end(color_keyword("and ") + color_keyword("if "), tab)
-        o.print_if_cond(self.cond_id, self.fused_inst)
-        print()
+    def dump(self, o, tab=0):
+        o._comment_fused(self.orig_jump, self.fused_inst, tab)
+        if self.prefetch is not None:
+            o._asm_inst(self.prefetch, tab)
+        o._tabs(tab)
+        o._keyword("and ")
+        o._keyword("if ")
+        o._if_cond(self.cond_id, self.fused_inst)
+        o._new_line()
 
 
 # This is used for ARM to fuse instructions which have the same condition
@@ -75,31 +88,42 @@ class Ast_If_cond:
         self.cond_id = cond_id
         self.br = br
         self.fused_inst = None
+        self.parent = None
+        self.level = 0
 
-    def print(self, o, tab=0):
-        o.print_commented_jump(None, self.fused_inst, tab)
-        print_tabbed_no_end(color_keyword("if "), tab)
-        o.print_if_cond(self.cond_id, self.fused_inst)
+    def dump(self, o, tab=0):
+        o._comment_fused(None, self.fused_inst, tab)
+        o._tabs(tab)
+        o._keyword("if ")
+        o._if_cond(self.cond_id, self.fused_inst)
 
         # If it contains only one instruction
-        if self.fused_inst == None and len(self.br.nodes) == 1 and \
-                len(self.br.nodes[0]) == 1 and isinstance(self.br.nodes[0], list):
-            print_no_end(" :  ")
-            o.print_inst(self.br.nodes[0][0], 0)
-        else:
-            print(" {")
-            self.br.print(o, tab+1)
-            print_tabbed("}", tab)
+        # if self.fused_inst == None and len(self.br.nodes) == 1 and \
+                # len(self.br.nodes[0]) == 1 and isinstance(self.br.nodes[0], list):
+            # o._add(" :  ")
+            # o._asm_inst(self.br.nodes[0][0], 0)
+        # else:
+        o._add(" {")
+        o._new_line()
+        self.br.dump(o, tab+1)
+        o._tabs(tab)
+        o._add("}")
+        o._new_line()
 
 
 class Ast_Ifelse:
-    def __init__(self, jump_inst, br_next_jump, br_next):
+    def __init__(self, jump_inst, br_next_jump, br_next,
+                 expected_next_addr, prefetch=None):
         self.jump_inst = jump_inst
         self.br_next = br_next
         self.br_next_jump = br_next_jump
         self.fused_inst = None
+        self.prefetch = prefetch
+        self.parent = None
+        self.level = 0
+        self.expected_next_addr = expected_next_addr
 
-    def print(self, o, tab=0, print_else_keyword=False):
+    def dump(self, o, tab=0, print_else_keyword=False):
         ARCH_UTILS = o.ctx.libarch.utils
 
         #
@@ -123,31 +147,36 @@ class Ast_Ifelse:
             br_next, br_next_jump = br_next_jump, br_next
             inv_if = True
             
-        o.print_commented_jump(self.jump_inst, self.fused_inst, tab)
+        o._comment_fused(self.jump_inst, self.fused_inst, tab)
 
+        if self.prefetch is not None:
+            o._asm_inst(self.prefetch, tab)
+
+        o._tabs(tab)
         if print_else_keyword:
-            print_tabbed_no_end(color_keyword("else if "), tab)
+            o._keyword("else if ")
         else:
-            print_tabbed_no_end(color_keyword("if "), tab)
+            o._keyword("if ")
 
         # jump_inst is the condition to go to the else-part
         if inv_if:
-            o.print_if_cond(ARCH_UTILS.get_cond(self.jump_inst),
+            o._if_cond(ARCH_UTILS.get_cond(self.jump_inst),
                             self.fused_inst)
         else:
-            o.print_if_cond(ARCH_UTILS.invert_cond(self.jump_inst),
+            o._if_cond(ARCH_UTILS.invert_cond(self.jump_inst),
                             self.fused_inst)
 
-        print(" {")
+        o._add(" {")
+        o._new_line()
 
         # if-part
-        br_next.print(o, tab+1)
+        br_next.dump(o, tab+1)
+        o._tabs(tab)
+        o._add("}")
 
         # else-part
         if len(br_next_jump.nodes) > 0:
-            print_tabbed_no_end("} ", tab)
-            
-            # 
+            #
             # if {
             #   ...
             # } else {
@@ -169,43 +198,55 @@ class Ast_Ifelse:
             br = br_next_jump
 
             if len(br.nodes) == 1 and isinstance(br.nodes[0], Ast_Ifelse):
-                print()
-                br.nodes[0].print(o, tab, True)
+                o._new_line()
+                br.nodes[0].dump(o, tab, print_else_keyword=True)
                 return
 
             if len(br.nodes) == 2 and isinstance(br.nodes[0], list) and \
                   len(br.nodes[0]) == 1 and ARCH_UTILS.is_cmp(br.nodes[0][0]) and \
                   isinstance(br.nodes[1], Ast_Ifelse):
-                print()
-                br.nodes[1].print(o, tab, True)
+                o._new_line()
+                br.nodes[1].dump(o, tab, print_else_keyword=True)
                 return
 
-            print(color_keyword("else ") + "{")
-            br.print(o, tab+1)
+            o._keyword(" else")
+            o._add(" {")
+            o._new_line()
+            br.dump(o, tab+1)
 
-        print_tabbed("}", tab)
+            o._tabs(tab)
+            o._add("}")
+
+        o._new_line()
 
 
 class Ast_Goto:
     def __init__(self, addr):
         self.addr_jump = addr
+        self.parent = None
+        self.level = 0
 
-    def print(self, o, tab=0):
-        print_tabbed_no_end(color_keyword("goto "), tab)
-        print(color_addr(self.addr_jump, False))
+        # The algorithm can add some goto and remove some of them
+        # if they are unnecessary. But sometimes, goto are added
+        # for more readability, so set to True to keep them.
+        self.dont_remove = False
+
+    def dump(self, o, tab=0):
+        o._tabs(tab)
+        o._keyword("goto ")
+        o._label_or_address(self.addr_jump, -1, False)
+        o._new_line()
 
 
 class Ast_Loop:
     def __init__(self):
         self.branch = Ast_Branch()
-        self.epilog = None
         self.is_infinite = False
+        self.parent = None
+        self.level = 0
 
     def add(self, node):
         self.branch.add(node)
-
-    def set_epilog(self, epilog):
-        self.epilog = epilog
 
     def set_infinite(self, v):
         self.is_infinite = v
@@ -213,21 +254,31 @@ class Ast_Loop:
     def set_branch(self, b):
         self.branch = b
 
-    def print(self, o, tab=0):
+    def dump(self, o, tab=0):
+        o._tabs(tab)
         if self.is_infinite:
-            print_tabbed(color_keyword("infiniteloop") + " {", tab)
+            o._keyword("for")
+            o._add(" (;;) {")
         else:
-            print_tabbed(color_keyword("loop") + " {", tab)
-        self.branch.print(o, tab+1)
-        print_tabbed("}", tab)
-        if self.epilog != None:
-            self.epilog.print(o, tab)
+            o._keyword("loop")
+            o._add(" {")
+        o._new_line()
+        self.branch.dump(o, tab+1)
+        o._tabs(tab)
+        o._add("}")
+        o._new_line()
 
 
+# ONLY FOR DEBUG !!
 class Ast_Comment:
     def __init__(self, text):
         self.text = text
+        self.parent = None
+        self.level = 0
+        self.nodes = []
 
-    def print(self, o, tab=0):
+    def dump(self, o, tab=0):
         if o.ctx.comments:
-            print_comment("# " + self.text, tab)
+            o._tabs(tab)
+            o._comment("# " + self.text)
+            o._new_line()

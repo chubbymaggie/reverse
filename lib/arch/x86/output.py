@@ -17,24 +17,24 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
-import struct
-
-from lib.output import (OutputAbs, print_no_end, print_tabbed_no_end,
-        print_comment, print_comment_no_end, INTERN_COMMENTS)
-from lib.colors import (color, color_addr, color_retcall, color_string,
-        color_var, color_section, color_intern_comment)
-from lib.utils import get_char, BYTES_PRINTABLE_SET
-from lib.arch.x86.utils import (inst_symbol, is_call, is_jump, is_ret,
-    is_uncond_jump, cond_symbol)
 from capstone.x86 import (X86_INS_ADD, X86_INS_AND, X86_INS_CMP, X86_INS_DEC,
         X86_INS_IDIV, X86_INS_IMUL, X86_INS_INC, X86_INS_MOV, X86_INS_SHL,
         X86_INS_SHR, X86_INS_SUB, X86_INS_XOR, X86_OP_FP, X86_OP_IMM,
         X86_OP_INVALID, X86_OP_MEM, X86_OP_REG, X86_REG_EBP, X86_REG_EIP,
         X86_REG_RBP, X86_REG_RIP, X86_INS_CDQE, X86_INS_LEA, X86_INS_MOVSX,
-        X86_INS_OR, X86_INS_NOT, X86_INS_SCASB, X86_PREFIX_REPNE,
+        X86_INS_OR, X86_INS_NOT, X86_PREFIX_REP, X86_PREFIX_REPNE,
         X86_INS_TEST, X86_INS_JNS, X86_INS_JS, X86_INS_MUL, X86_INS_JP,
         X86_INS_JNP, X86_INS_JCXZ, X86_INS_JECXZ, X86_INS_JRCXZ,
-        X86_INS_SAR, X86_INS_SAL)
+        X86_INS_SAR, X86_INS_SAL, X86_INS_MOVZX, X86_INS_STOSB,
+        X86_INS_STOSW, X86_INS_STOSD, X86_INS_STOSQ, X86_INS_MOVSB,
+        X86_INS_MOVSW, X86_INS_MOVSD, X86_INS_MOVSQ, X86_INS_LODSB,
+        X86_INS_LODSW, X86_INS_LODSD, X86_INS_LODSQ, X86_INS_CMPSB,
+        X86_INS_CMPSW, X86_INS_CMPSD, X86_INS_CMPSQ, X86_INS_SCASB,
+        X86_INS_SCASW, X86_INS_SCASD, X86_INS_SCASQ)
+
+from lib.output import OutputAbs
+from lib.arch.x86.utils import (inst_symbol, is_call, is_jump, is_ret,
+    is_uncond_jump, cond_symbol)
 
 
 ASSIGNMENT_OPS = {X86_INS_XOR, X86_INS_AND, X86_INS_OR,
@@ -56,61 +56,39 @@ JMP_ADD_ZERO = {
 
 INST_CHECK = {X86_INS_SUB, X86_INS_ADD, X86_INS_MOV, X86_INS_CMP,
     X86_INS_XOR, X86_INS_AND, X86_INS_SHR, X86_INS_SHL, X86_INS_IMUL,
-    X86_INS_SAR, X86_INS_SAL,
+    X86_INS_SAR, X86_INS_SAL, X86_INS_MOVZX,
     X86_INS_DEC, X86_INS_INC, X86_INS_LEA, X86_INS_MOVSX, X86_INS_OR}
+
+
+INST_STOS = {X86_INS_STOSB, X86_INS_STOSW, X86_INS_STOSD, X86_INS_STOSQ}
+INST_LODS = {X86_INS_LODSB, X86_INS_LODSW, X86_INS_LODSD, X86_INS_LODSQ}
+INST_MOVS = {X86_INS_MOVSB, X86_INS_MOVSW, X86_INS_MOVSD, X86_INS_MOVSQ}
+INST_CMPS = {X86_INS_CMPSB, X86_INS_CMPSW, X86_INS_CMPSD, X86_INS_CMPSQ}
+INST_SCAS = {X86_INS_SCASB, X86_INS_SCASW, X86_INS_SCASD, X86_INS_SCASQ}
+
+REP_PREFIX = {X86_PREFIX_REPNE, X86_PREFIX_REP}
 
 
 class Output(OutputAbs):
     # Return True if the operand is a variable (because the output is
     # modified, we reprint the original instruction later)
-    def print_operand(self, i, num_op, hexa=False, show_deref=True):
+    def _operand(self, i, num_op, hexa=False, show_deref=True,
+                 force_dont_print_data=False):
         def inv(n):
             return n == X86_OP_INVALID
 
         op = i.operands[num_op]
 
         if op.type == X86_OP_IMM:
-            imm = op.value.imm
-            sec_name, is_data = self.binary.is_address(imm)
-
-            if sec_name is not None:
-                print_no_end(hex(imm))
-                if self.ctx.sectionsname:
-                    print_no_end(" (" + color_section(sec_name) + ")")
-                if is_data:
-                    s = self.binary.get_string(imm, self.ctx.max_data_size)
-                    print_no_end(" " + color_string(s))
-                if imm in self.binary.reverse_symbols:
-                    print_no_end(" ")
-                    self.print_symbol(imm)
-            elif op.size == 1:
-                print_no_end(color_string("'%s'" % get_char(imm)))
-            elif hexa:
-                print_no_end(hex(imm))
-            else:
-                print_no_end(str(imm))
-
-                if imm > 0:
-                    packed = struct.pack("<L", imm)
-                    if set(packed).issubset(BYTES_PRINTABLE_SET):
-                        print_no_end(color_string(" \""))
-                        print_no_end(color_string("".join(map(chr, packed))))
-                        print_no_end(color_string("\""))
-                        return False
-
-                # returns True because capstone print immediate in hexa
-                # it will be printed in a comment, sometimes it better
-                # to have the value in hexa
-                return True
-
-            return False
+            return self._imm(i, op.value.imm, op.size, hexa,
+                             force_dont_print_data=force_dont_print_data)
 
         elif op.type == X86_OP_REG:
-            print_no_end(i.reg_name(op.value.reg))
+            self._add(i.reg_name(op.value.reg))
             return False
 
         elif op.type == X86_OP_FP:
-            print_no_end("%f" % op.value.fp)
+            self._add("%f" % op.value.fp)
             return False
 
         elif op.type == X86_OP_MEM:
@@ -121,155 +99,178 @@ class Output(OutputAbs):
 
                 if (mm.base == X86_REG_RBP or mm.base == X86_REG_EBP) and \
                        self.var_name_exists(i, num_op):
-                    print_no_end(color_var(self.get_var_name(i, num_op)))
+                    if i.id == X86_INS_LEA:
+                        self._add("&(")
+                    self._variable(self.get_var_name(i, num_op))
+                    if i.id == X86_INS_LEA:
+                        self._add(")")
                     return True
+
                 elif mm.base == X86_REG_RIP or mm.base == X86_REG_EIP:
-                    addr = i.address + i.size + mm.disp
-                    print_no_end("*({0})".format(
-                        self.binary.reverse_symbols.get(addr, hex(addr))))
+                    ad = i.address + i.size + mm.disp
+                    section = self.binary.get_section(ad)
+
+                    if section is not None:
+                        val = section.read_int(ad, op.size)
+                        if val in self.binary.reverse_symbols:
+                            self._imm(i, val, 0, True, section=section,
+                                      print_data=False,
+                                      force_dont_print_data=force_dont_print_data)
+                            return True
+
+                    if show_deref:
+                        self._add("*(")
+                    self._imm(i, ad, 4, True, print_data=False,
+                              force_dont_print_data=force_dont_print_data)
+                    if show_deref:
+                        self._add(")")
                     return True
 
             printed = False
             if show_deref:
-                print_no_end("*(")
+                self._add("*(")
 
             if not inv(mm.base):
-                print_no_end("%s" % i.reg_name(mm.base))
+                self._add("%s" % i.reg_name(mm.base))
                 printed = True
 
             elif not inv(mm.segment):
-                print_no_end("%s" % i.reg_name(mm.segment))
+                self._add("%s" % i.reg_name(mm.segment))
                 printed = True
 
             if not inv(mm.index):
                 if printed:
-                    print_no_end(" + ")
+                    self._add(" + ")
                 if mm.scale == 1:
-                    print_no_end("%s" % i.reg_name(mm.index))
+                    self._add("%s" % i.reg_name(mm.index))
                 else:
-                    print_no_end("(%s*%d)" % (i.reg_name(mm.index), mm.scale))
+                    self._add("(%s*%d)" % (i.reg_name(mm.index), mm.scale))
                 printed = True
 
             if mm.disp != 0:
-                if mm.disp < 0:
+                section = self.binary.get_section(mm.disp)
+                is_sym = mm.disp in self.binary.reverse_symbols
+
+                if is_sym or section is not None:
                     if printed:
-                        print_no_end(" - ")
-                    print_no_end(-mm.disp)
+                        self._add(" + ")
+                    self._imm(i, mm.disp, 0, True, section=section, print_data=False,
+                              force_dont_print_data=force_dont_print_data)
                 else:
                     if printed:
-                        print_no_end(" + ")
-                        print_no_end(mm.disp)
-                    else:
-                        if mm.disp in self.binary.reverse_symbols:
-                            print_no_end(hex(mm.disp) + " ")
-                            self.print_symbol(mm.disp)
+                        if mm.disp < 0:
+                            self._add(" - %d" % (-mm.disp))
                         else:
-                            print_no_end(hex(mm.disp))
+                            self._add(" + %d" % mm.disp)
+                    else:
+                        self._add("%d" % mm.disp)
 
             if show_deref:
-                print_no_end(")")
+                self._add(")")
             return True
 
 
-    def print_if_cond(self, jump_cond, fused_inst):
+    def _if_cond(self, jump_cond, fused_inst):
         if fused_inst is None:
-            print_no_end(cond_symbol(jump_cond))
+            self._add(cond_symbol(jump_cond))
             if jump_cond in JMP_ADD_ZERO:
-                print_no_end(" 0")
+                self._add(" 0")
             return
 
         assignment = fused_inst.id in ASSIGNMENT_OPS
 
         if assignment:
-            print_no_end("(")
-        print_no_end("(")
-        self.print_operand(fused_inst, 0)
-        print_no_end(" ")
+            self._add("(")
+        self._add("(")
+        self._operand(fused_inst, 0)
+        self._add(" ")
 
         if fused_inst.id == X86_INS_TEST:
-            print_no_end(cond_symbol(jump_cond))
+            self._add(cond_symbol(jump_cond))
         elif assignment:
-            print_no_end(inst_symbol(fused_inst))
-            print_no_end(" ")
-            self.print_operand(fused_inst, 1)
-            print_no_end(") ")
-            print_no_end(cond_symbol(jump_cond))
+            self._add(inst_symbol(fused_inst))
+            self._add(" ")
+            self._operand(fused_inst, 1)
+            self._add(") ")
+            self._add(cond_symbol(jump_cond))
         else:
-            print_no_end(cond_symbol(jump_cond))
-            print_no_end(" ")
-            self.print_operand(fused_inst, 1)
+            self._add(cond_symbol(jump_cond))
+            self._add(" ")
+            self._operand(fused_inst, 1)
 
         if fused_inst.id == X86_INS_TEST or \
                 (fused_inst.id != X86_INS_CMP and \
                  (jump_cond in JMP_ADD_ZERO or assignment)):
-            print_no_end(" 0")
+            self._add(" 0")
 
-        print_no_end(")")
-
-
-    def print_inst(self, i, tab=0, prefix=""):
-        def get_inst_str():
-            nonlocal i
-            return "%s %s" % (i.mnemonic, i.op_str)
-
-        if prefix == "# ":
-            if self.ctx.comments:
-                print_comment_no_end(prefix, tab)
-                print_no_end(color_addr(i.address))
-                print_comment(get_inst_str())
-            return
-
-        if i.address in self.ctx.all_fused_inst:
-            return
-
-        if i.address != self.ctx.addr and \
-                i.address in self.ctx.dis.binary.reverse_symbols:
-            print_tabbed_no_end("", tab)
-            self.print_symbol(i.address)
-            print()
-
-        modified = self.__print_inst(i, tab, prefix)
-
-        if i.address in INTERN_COMMENTS:
-            print_no_end(color_intern_comment(" ; "))
-            print_no_end(color_intern_comment(INTERN_COMMENTS[i.address]))
-
-        if modified and self.ctx.comments:
-            print_comment_no_end(" # " + get_inst_str())
-
-        print()
+        self._add(")")
 
 
-    def __print_inst(self, i, tab=0, prefix=""):
-        def get_inst_str():
-            nonlocal i
-            return "%s %s" % (i.mnemonic, i.op_str)
+    def _rep_begin(self, i, tab):
+        if i.prefix[0] in REP_PREFIX:
+            self._tabs(tab)
+            self._keyword("while")
+            # TODO: for 16 and 32 bits
+            self._add(" (!rcx)) {")
+            self._new_line()
+            tab += 1
+        return tab
 
-        print_tabbed_no_end(color_addr(i.address), tab)
+
+    def _rep_end(self, i, tab):
+        if i.prefix[0] in REP_PREFIX:
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._add("rcx--")
+            self._new_line()
+            if i.prefix[0] == X86_PREFIX_REPNE:
+                self._tabs(tab)
+                self._keyword("if")
+                self._add(" (!Z) ")
+                self._keyword("break")
+                self._new_line()
+            tab -= 1
+            self._tabs(tab)
+            self._add("}")
+
+
+    def _sub_asm_inst(self, i, tab=0, prefix=""):
+        tab = self._rep_begin(i, tab)
+        self._label_and_address(i.address, tab)
+        self._bytes(i)
 
         if is_ret(i):
-            print_no_end(color_retcall(get_inst_str()))
-            return
+            self._retcall(self.get_inst_str(i))
+            return False
 
         if is_call(i):
-            print_no_end(color_retcall(i.mnemonic) + " ")
-            self.print_operand(i, 0, hexa=True)
-            return
+            self._retcall(i.mnemonic)
+            self._add(" ")
+            self._operand(i, 0, hexa=True, force_dont_print_data=True)
+            return False
 
         # Here we can have conditional jump with the option --dump
         if is_jump(i):
+            self._add(i.mnemonic + " ")
             if i.operands[0].type != X86_OP_IMM:
-                print_no_end(i.mnemonic + " ")
-                self.print_operand(i, 0)
-                if is_uncond_jump(i) and self.ctx.comments:
-                    print_comment_no_end(" # STOPPED")
-                return
-            try:
-                addr = i.operands[0].value.imm
-                print_no_end(i.mnemonic + " " + color(hex(addr), self.ctx.addr_color[addr]))
-            except KeyError:
-                print_no_end(i.mnemonic + " " + hex(addr))
-            return
+                self._operand(i, 0, force_dont_print_data=True)
+                self.inst_end_here()
+                if is_uncond_jump(i) and self.ctx.comments and not self.ctx.dump \
+                        and not i.address in self.ctx.dis.jmptables:
+                    self._add(" ")
+                    self._comment("# STOPPED")
+                return False
+
+            addr = i.operands[0].value.imm
+
+            if self.is_symbol(addr):
+                self._symbol(addr)
+            else:
+                if addr in self.ctx.addr_color:
+                    self._label_or_address(addr, -1, False)
+                else:
+                    self._add(hex(addr))
+            return False
 
 
         modified = False
@@ -277,104 +278,158 @@ class Output(OutputAbs):
         if i.id in INST_CHECK:
             if (i.id == X86_INS_OR and i.operands[1].type == X86_OP_IMM and
                     i.operands[1].value.imm == -1):
-                self.print_operand(i, 0)
-                print_no_end(" = -1")
+                self._operand(i, 0)
+                self._add(" = -1")
 
             elif (i.id == X86_INS_AND and i.operands[1].type == X86_OP_IMM and
                     i.operands[1].value.imm == 0):
-                self.print_operand(i, 0)
-                print_no_end(" = 0")
+                self._operand(i, 0)
+                self._add(" = 0")
 
             elif (all(op.type == X86_OP_REG for op in i.operands) and
                     len(set(op.value.reg for op in i.operands)) == 1 and
                     i.id == X86_INS_XOR):
-                self.print_operand(i, 0)
-                print_no_end(" = 0")
+                self._operand(i, 0)
+                self._add(" = 0")
 
             elif i.id == X86_INS_INC or i.id == X86_INS_DEC:
-                self.print_operand(i, 0)
-                print_no_end(inst_symbol(i))
+                self._operand(i, 0)
+                self._add(inst_symbol(i))
 
             elif i.id == X86_INS_LEA:
-                self.print_operand(i, 0)
-                print_no_end(" = &(")
-                self.print_operand(i, 1)
-                print_no_end(")")
+                self._operand(i, 0)
+                self._add(" = ")
+                self._operand(i, 1, show_deref=False)
+
+            elif i.id == X86_INS_MOVZX:
+                self._operand(i, 0)
+                self._add(" = (zero ext) ")
+                self._operand(i, 1)
 
             elif i.id == X86_INS_IMUL:
                 if len(i.operands) == 3:
-                    self.print_operand(i, 0)
-                    print_no_end(" = ")
-                    self.print_operand(i, 1)
-                    print_no_end(" " + inst_symbol(i).rstrip('=') + " ")
-                    self.print_operand(i, 2)
+                    self._operand(i, 0)
+                    self._add(" = ")
+                    self._operand(i, 1)
+                    self._add(" " + inst_symbol(i).rstrip('=') + " ")
+                    self._operand(i, 2)
                 elif len(i.operands) == 2:
-                    self.print_operand(i, 0)
-                    print_no_end(" " + inst_symbol(i) + " ")
-                    self.print_operand(i, 2)
+                    self._operand(i, 0)
+                    self._add(" " + inst_symbol(i) + " ")
+                    self._operand(i, 1)
                 elif len(i.operands) == 1:
                     sz = i.operands[0].size
                     if sz == 1:
-                        print_no_end("ax = al * ")
+                        self._add("ax = al * ")
                     elif sz == 2:
-                        print_no_end("dx:ax = ax * ")
+                        self._add("dx:ax = ax * ")
                     elif sz == 4:
-                        print_no_end("edx:eax = eax * ")
+                        self._add("edx:eax = eax * ")
                     elif sz == 8:
-                        print_no_end("rdx:rax = rax * ")
-                    self.print_operand(i, 0)
+                        self._add("rdx:rax = rax * ")
+                    self._operand(i, 0)
 
             else:
-                self.print_operand(i, 0)
-                print_no_end(" " + inst_symbol(i) + " ")
-                self.print_operand(i, 1)
+                self._operand(i, 0)
+                self._add(" " + inst_symbol(i) + " ")
+                self._operand(i, 1)
 
             modified = True
 
         elif i.id == X86_INS_CDQE:
-            print_no_end("rax = eax")
+            self._add("rax = eax")
             modified = True
 
         elif i.id == X86_INS_IDIV:
-            print_no_end('eax = edx:eax / ')
-            self.print_operand(i, 0)
-            print_no_end('; edx = edx:eax % ')
-            self.print_operand(i, 0)
+            self._add('eax = edx:eax / ')
+            self._operand(i, 0)
+            self._add('; edx = edx:eax % ')
+            self._operand(i, 0)
             modified = True
 
         elif i.id == X86_INS_MUL:
             lut = {1: ("al", "ax"), 2: ("ax", "dx:ax"), 4: ("eax", "edx:eax"),
                     8: ("rax", "rdx:rax")}
             src, dst = lut[i.operands[0].size]
-            print_no_end('{0} = {1} * '.format(dst, src))
-            self.print_operand(i, 0)
+            self._add('{0} = {1} * '.format(dst, src))
+            self._operand(i, 0)
             modified = True
 
         elif i.id == X86_INS_NOT:
-            self.print_operand(i, 0)
-            print_no_end(' ^= -1')
+            self._operand(i, 0)
+            self._add(' ^= -1')
             modified = True
 
-        elif i.id == X86_INS_SCASB and i.prefix[0] == X86_PREFIX_REPNE:
-            print_no_end('while (')
-            self.print_operand(i, 1)
-            print_no_end(' != ')
-            self.print_operand(i, 0)
-            print_no_end(') { ')
-            self.print_operand(i, 1, show_deref=False)
-            print_no_end('++; cx--; } ')
-            self.print_operand(i, 1, show_deref=False)
-            print_no_end('++; cx--;')
+        elif i.id in INST_SCAS:
+            self._operand(i, 0)
+            self._add(" cmp ")
+            self._operand(i, 1)
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 1, show_deref=False)
+            self._add(" += D")
+            modified = True
+
+        elif i.id in INST_STOS:
+            self._operand(i, 0)
+            self._add(" = ")
+            self._operand(i, 1)
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 0, show_deref=False)
+            self._add(" += D")
+            modified = True
+
+        elif i.id in INST_LODS:
+            self._operand(i, 0)
+            self._add(" = ")
+            self._operand(i, 1)
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 1, show_deref=False)
+            self._add(" += D")
+            modified = True
+
+        elif i.id in INST_CMPS:
+            self._operand(i, 0)
+            self._add(" cmp ")
+            self._operand(i, 1)
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 0, show_deref=False)
+            self._add(" += D")
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 1, show_deref=False)
+            self._add("' += D")
+            modified = True
+
+        elif i.id in INST_MOVS:
+            self._operand(i, 0)
+            self._add(" = ")
+            self._operand(i, 1)
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 0, show_deref=False)
+            self._add(" += D")
+            self._new_line()
+            self._label_or_address(i.address, tab)
+            self._operand(i, 1, show_deref=False)
+            self._add(" += D")
             modified = True
 
         else:
-            print_no_end("%s " % i.mnemonic)
             if len(i.operands) > 0:
-                modified = self.print_operand(i, 0)
+                self._add("%s " % i.mnemonic)
+                modified = self._operand(i, 0)
                 k = 1
                 while k < len(i.operands):
-                    print_no_end(", ")
-                    modified |= self.print_operand(i, k)
+                    self._add(", ")
+                    modified |= self._operand(i, k)
                     k += 1
+            else:
+                self._add(i.mnemonic)
+
+        self._rep_end(i, tab)
 
         return modified

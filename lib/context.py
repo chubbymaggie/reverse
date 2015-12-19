@@ -26,6 +26,9 @@ class Context():
         self.update()
         self.reset_all()
 
+        # For info() messages
+        self.quiet = False
+
         # Parameter options
         self.comments = True
         self.sectionsname = False
@@ -33,18 +36,20 @@ class Context():
         self.color = True
         self.max_data_size = 30
         self.filename = None
-        self.symfile = None
         self.syms = False
-        self.calls = False
+        self.calls_in_section = None
         self.entry = None # string : symbol | EP | 0xNNNN
         self.dump = False
         self.vim = False
         self.lines = 30
         self.graph = False # Print graph != gph -> object
-        self.interactive = False
+        self.interactive_mode = False
         self.debug = False
         self.raw_base = 0
         self.raw_big_endian = False
+        self.list_sections = False
+        self.print_bytes = False
+        self.print_data = False
 
 
     def reset_all(self):
@@ -53,13 +58,17 @@ class Context():
         self.gph = None
         self.libarch = None
         self.raw_type = None
+        self.db = None
         self.reset_vars()
 
 
     def reset_vars(self):
         # Other variables
-        self.addr = 0 # address where we disassemble
+        self.entry_addr = 0 # address where we disassemble,
+                            # same as self.entry but it's an int
         self.addr_color = {}
+        self.reverse_labels = {} # label -> addr
+        self.labels = {} # addr -> label
         self.color_counter = 112
         self.local_vars_idx = {}
         self.local_vars_size = []

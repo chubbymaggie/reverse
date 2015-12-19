@@ -1,29 +1,74 @@
 Reverse
 =======
 
-Reverse engineering for x86/ARM/MIPS binaries. Generate a more readable code
-(pseudo-C) with colored syntax.
+It generates a more readable code (pseudo-C) with colored syntax. An interactive
+mode is in development.
 
-Supported formats : `ELF`, `PE`.
-
+It supports :
+* architectures : x86, ARM, MIPS
+* formats : ELF, PE, RAW
 
 The `Makefile` is used only for checking tests.
 
 
 ## Requirements
 
-    python >= 3.4
-    capstone + python bindings (see requirements.sh)
-    python-pyelftools
-    https://github.com/simonzack/pefile-py3k
-    terminal with 256 colors (if not use the option `--nocolor`)
+* python >= 3.4
+* [capstone](https://github.com/aquynh/capstone)
+* [python-pyelftools](https://github.com/eliben/pyelftools)
+* [pefile](https://github.com/mlaferrera/python3-pefile)
+* [python-msgpack](https://github.com/msgpack/msgpack-python)
+* terminal with 256 colors (if not, use the option `--nocolor`)
 
-For Python binding of [Capstone engine](http://www.capstone-engine.org), you 
-can install it from PyPi, like followings: 
+You can run `requirements.sh` which will retrieve all requirements.
 
-    sudo pip3 install capstone
 
-You can also run `requirements.sh` which will retrieve all requirements.
+## Pseudo-decompilation of functions
+
+Here the option `-x main` is optional because the binary contains the symbol main.
+
+    $ ./reverse.py tests/server.bin
+
+![reverse](/images/screenshot.png?raw=true)
+
+
+## Interactive mode (`-i`)
+
+More commands are available in this mode (`da`, `db`, ...). See `help`
+for a full list.
+
+
+## Visual mode (NEW)
+
+From the interactive mode, use the command `v` to enter in the visual mode.
+This mode requires `ncurses`. Use the `tab` to switch between dump/decompilation.
+
+More features will come :
+
+* reload automatically if the analyzer has modified the content
+* multi-lines comments
+* create data
+* symbols renaming
+* stack variables
+* x-refs
+* structure, enums
+* ...
+
+![reverse](/images/visual.png?raw=true)
+
+
+## Switch jump-tables example
+
+Switch statements which require a jump-table are not detected automatically.
+So we need to tell it which jump-table to use.
+
+    $ ./reverse.py -i tests/others/switch.bin
+    >> x
+    ...
+    >> jmptable 0x400526 0x400620 11 8 
+    # A jump-table at 0x400620 is set with 11 entries, an address is on 8 bytes.
+
+![reverse](/images/switch.png?raw=true)
 
 
 ## Analyze shellcodes
@@ -46,27 +91,10 @@ For every `int 0x80`, the tool try to detect syscalls with parameters.
     }
 
 
-## Example
-
-    $ ./reverse.py tests/nestedloop1.bin
-
-![reverse](http://hippersoft.fr/projects/rev2.jpg)
-
-By opening `d3/index.html` (with the option `--graph`) you will be able to
-see the flow graph :
-
-![graph](http://hippersoft.fr/projects/graph.jpg)
-
-
 ## Edit with vim
 
     $ ./reverse tests/dowhile1.bin --vim
     You can now run : vim dowhile1.bin.rev -S dowhile1.bin.vim
-
-
-## Interactive mode
-
-With the option `-i` you enter in the interactive mode. See `help`.
 
 
 ## Custom colors
