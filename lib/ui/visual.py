@@ -18,96 +18,60 @@
 #
 
 import curses
-from curses import A_UNDERLINE, color_pair
-from time import time
+
 from queue import Queue
+import traceback
 
-from lib import init_entry_addr, disasm
 from custom_colors import *
-from lib.disassembler import NB_LINES_TO_DISASM
+from lib.disassembler import RESERVED_PREFIX
+
+from lib.ui.window import *
+from lib.ui.inlineed import InlineEd
 
 
-MOUSE_EVENT = [0x1b, 0x5b, 0x4d]
-MOUSE_INTERVAL = 200
+class Visual(Window):
+    def __init__(self, gctx, ctx, analyzer):
+        Window.__init__(self, ctx.output, has_statusbar=True)
 
-MODE_DUMP = 1
-MODE_DECOMPILE = 2
-
-
-class Visual():
-    def __init__(self, console, disassembler, output):
+        self.ctx = ctx
+        self.gctx = gctx
         self.mode = MODE_DUMP
-        self.win_y = 0
-        self.cursor_y = 0
-        self.cursor_x = 0
-        self.output = output
-        self.token_lines = output.token_lines
-        self.dis = disassembler
-        self.console = console
-        self.search = None
-
+        self.dis = gctx.dis
+        self.analyzer = analyzer
         self.queue_wait_analyzer = Queue()
 
         # Last/first address printed (only in MODE_DUMP)
-        self.last_addr = max(output.addr_line)
-        self.first_addr = min(output.addr_line)
+        self.last_addr = max(self.output.addr_line)
+        self.first_addr = min(self.output.addr_line)
 
         self.stack = []
         self.saved_stack = [] # when we enter, go back, then re-enter
 
-        self.word_accepted_chars = ["_", "@", ".", "$"]
-
-        self.time_last_mouse_key = MOUSE_INTERVAL + 1
-        self.set_key_timeout = True
-
-        self.main_mapping = {
-            b"\x1b\x5b\x44": self.main_k_left,
-            b"\x1b\x5b\x43": self.main_k_right,
-            b"\x1b\x5b\x41": self.main_k_up,
-            b"\x1b\x5b\x42": self.main_k_down,
-            b"\x1b\x5b\x35\x7e": self.main_k_pageup,
-            b"\x1b\x5b\x36\x7e": self.main_k_pagedown,
+        new_mapping = {
             b"z": self.main_cmd_line_middle,
-            b"g": self.main_cmd_top,
-            b"G": self.main_cmd_bottom,
+            b"g": self.main_k_top,
+            b"G": self.main_k_bottom,
             b";": self.view_inline_comment_editor,
             b"%": self.main_cmd_next_bracket,
-            b"\x01": self.main_k_home, # ctrl-a
-            b"\x05": self.main_k_end, # ctrl-e
-            b"\x1b\x5b\x37\x7e": self.main_k_home,
-            b"\x1b\x5b\x38\x7e": self.main_k_end,
-            b"*": self.main_cmd_highlight_current_word,
-            b"\x0b": self.main_cmd_highlight_clear, # ctrl-k
             b"\n": self.main_cmd_enter,
             b"\x1b": self.main_cmd_escape,
             b"\t": self.main_cmd_switch_mode,
-            b"\x1b\x5b\x31\x3b\x35\x44": self.main_k_ctrl_left,
-            b"\x1b\x5b\x31\x3b\x35\x43": self.main_k_ctrl_right,
             b"c": self.main_cmd_code,
             b"p": self.main_cmd_set_function,
             b"{": self.main_k_prev_paragraph,
             b"}": self.main_k_next_paragraph,
+            b"x": self.main_cmd_xrefs,
+            b"r": self.main_cmd_rename,
+            b"I": self.main_cmd_inst_output,
 
             # I wanted ctrl-enter but it cannot be mapped on my terminal
             b"u": self.main_cmd_reenter, # u for undo
         }
 
-        self.inline_mapping = {
-            b"\x1b\x5b\x44": self.inline_k_left,
-            b"\x1b\x5b\x43": self.inline_k_right,
-            b"\x7f": self.inline_k_backspace,
-            b"\x1b\x5b\x37\x7e": self.inline_k_home,
-            b"\x1b\x5b\x38\x7e": self.inline_k_end,
-            b"\x1b\x5b\x33\x7e": self.inline_k_delete,
-            b"\x15": self.inline_k_ctrl_u,
-            b"\x0b": self.inline_k_ctrl_k,
-            b"\n": self.inline_k_enter,
-            b"\x01": self.inline_k_home, # ctrl-a
-            b"\x05": self.inline_k_end, # ctrl-e
-        }
+        self.mapping.update(new_mapping)
 
-        saved_quiet = self.console.ctx.quiet
-        self.console.ctx.quiet = True
+        saved_quiet = self.gctx.quiet
+        self.gctx.quiet = True
 
         self.screen = curses.initscr()
 
@@ -122,7 +86,7 @@ class Visual():
         curses.start_color()
         curses.use_default_colors()
 
-        if console.ctx.color:
+        if self.gctx.color:
             for i in range(0, curses.COLORS):
                 curses.init_pair(i, i, -1)
             curses.init_pair(1, 253, 66) # for the highlight search
@@ -130,111 +94,34 @@ class Visual():
             for i in range(0, curses.COLORS):
                 curses.init_pair(i, 7, -1) # white
 
-        curses.wrapper(self.view_main)
+        try:
+            curses.wrapper(self.start_view)
+        except:
+            curses.nocbreak()
+            curses.echo()
+            curses.endwin()
+            traceback.print_exc()
+            return
 
         curses.nocbreak()
         curses.echo()
         curses.endwin()
 
-        self.console.ctx.quiet = saved_quiet
+        self.gctx.quiet = saved_quiet
 
         if self.stack:
-            print("last address seen 0x%x" % self.console.ctx.entry_addr)
+            print(hex(self.ctx.entry))
 
 
-    def read_escape_keys(self):
-        if self.set_key_timeout:
-            self.screen.timeout(-1)
-
-        k = self.screen.getch()
-        seq = []
-
-        if k != -1:
-            while k:
-                seq.append(k & 0xff)
-                k >>= 8
-
-            self.screen.timeout(0)
-            for i in range(8):
-                k = self.screen.getch()
-                if k == -1:
-                    break
-                seq.append(k)
-
-                if seq == MOUSE_EVENT:
-                    seq.append(self.screen.getch())
-                    seq.append(self.screen.getch())
-                    seq.append(self.screen.getch())
-                    self.set_key_timeout = False
-                    return bytes(seq)
-
-        self.set_key_timeout = True
-        return bytes(seq)
-
-
-    def get_word_under_cursor(self):
-        num_line = self.win_y + self.cursor_y
-        line = self.output.lines[num_line]
-
-        if len(line) == 0:
-            return None
-
-        x = self.cursor_x
-        if x >= len(line):
-            return None
-
-        if not line[x].isalnum() and not line[x] in self.word_accepted_chars:
-            return None
-
-        curr = []
-        while x >= 0 and (line[x].isalnum() or line[x] in self.word_accepted_chars):
-            x -= 1
-        x += 1
-
-        while x < len(line) and (line[x].isalnum() or \
-                line[x] in self.word_accepted_chars):
-            curr.append(line[x])
-            x += 1
-        if curr:
-            return "".join(curr)
-        return None
-
-
-    def goto_line(self, new_line, h):
-        curr_line = self.win_y + self.cursor_y
-        diff = new_line - curr_line
-        if diff > 0:
-            self.scroll_down(h, diff, False)
-        elif diff < 0:
-            self.scroll_up(h, -diff, False)
-
-
-    # If the address is already in the output, we only move the cursor.
-    # Otherwise this address must be disassembled (it returns False).
-    def goto_address(self, ad, h, w):
-        if ad in self.output.addr_line:
-            self.goto_line(self.output.addr_line[ad], h)
-            if self.mode == MODE_DECOMPILE:
-                self.cursor_x = 0
-                self.main_k_home(h, w)
-            return True
-        return False
-
-
-    def exec_disasm(self, addr, h):
-        self.console.ctx.reset_vars()
-        self.console.ctx.entry_addr = addr
+    def exec_disasm(self, addr, h, dump_until=-1):
+        self.ctx = self.gctx.get_addr_context(addr)
 
         if self.mode == MODE_DUMP:
-            self.console.ctx.dump = True
-            o = self.dis.dump_asm(self.console.ctx, NB_LINES_TO_DISASM)
-            self.console.ctx.dump = False
+            o = self.ctx.dump_asm(until=dump_until)
 
         elif self.mode == MODE_DECOMPILE:
-            self.screen.addstr(h, 0, "decompiling...")
-            self.screen.refresh()
-            self.console.ctx.dump = False
-            o = disasm(self.console.ctx)
+            self.status_bar("decompiling...", h, True)
+            o = self.ctx.decompile()
 
         if o is not None:
             self.output = o
@@ -245,59 +132,62 @@ class Visual():
         return False
 
 
-    def view_main_redraw(self, h, w):
-        i = 0
-        while i < h:
-            if self.win_y + i < len(self.token_lines):
-                self.print_line(w, i)
-            else:
-                # force to clear the entire line
-                self.screen.move(i, 0)
-            self.screen.clrtoeol()
-            i += 1
+    def main_cmd_rename(self, h, w):
+        h2 = 1
+        w2 = int(w*6/7)
 
-        self.screen.move(h, 0)
-        self.screen.clrtoeol()
-        self.screen.refresh()
+        x = int((w - w2)/2) - 1
+        y = int((h - h2)/2) - 1
+
+        # A background with borders
+        scr_borders = curses.newwin(h2 + 2, w2 + 2, y, x)
+        scr_borders.border()
+        title = " rename "
+        scr_borders.addstr(0, int((w2 - len(title))/2), title)
+        scr_borders.refresh()
+
+        # The message box
+        scr = curses.newwin(h2, w2, y + 1, x + 1)
+
+        w = Window(None)
+        w.print_curr_line = False
+
+        word = self.get_word_under_cursor()
+
+        if word[:4] in RESERVED_PREFIX:
+            try:
+                ad = int(word[4:], 16)
+            except:
+                return True
+            word = ""
+        else:
+            if word not in self.dis.binary.symbols:
+                return True
+            ad = self.dis.binary.symbols[word]
+
+        text = w.open_textbox(scr, word)
+
+        if word == text or not text or text[:4] in RESERVED_PREFIX:
+            return True
+
+        self.dis.add_symbol(ad, text)
+
+        self.reload_output(h)
+        self.gctx.db.modified = True
+
+        return True
 
 
-    def view_main(self, screen):
-        screen.clear()
-        self.screen.keypad(False)
-        refr = True
-
-        while 1:
-            (h, w) = screen.getmaxyx()
-            h -= 1 # status bar
-            if refr:
-                self.view_main_redraw(h, w)
-                refr = False
-
-            size_line = len(self.output.lines[self.win_y + self.cursor_y])
-            if self.cursor_x >= size_line > 0:
-                x = size_line - 1
-            else:
-                x = self.cursor_x
-
-            screen.move(self.cursor_y, x)
-
-            k = self.read_escape_keys()
-
-            if k == b"q":
-                break
-
-            if k in self.main_mapping:
-                refr = self.main_mapping[k](h, w)
-            elif k.startswith(b"\x1b[M"):
-                refr = self.main_mouse_event(k, h, w)
+    def main_cmd_inst_output(self, h, w):
+        self.gctx.capstone_string = not self.gctx.capstone_string
+        self.reload_output(h)
+        return True
 
 
     def view_inline_comment_editor(self, h, w):
         line = self.win_y + self.cursor_y
         if line not in self.output.line_addr:
             return True
-
-        self.console.ctx.db.modified = True
 
         addr = self.output.line_addr[line]
 
@@ -317,179 +207,36 @@ class Visual():
 
         # xbegin is the first index just after all operands
         # So we need to add 1 to be at the index of ;
-        xbegin, _ = self.output.index_end_inst[line]
-        self.comm = []
-        screen = self.screen
-        y = self.cursor_y
-        col_intern = color_pair(COLOR_USER_COMMENT.val) | A_UNDERLINE
+        xbegin, idx_token = self.output.index_end_inst[line]
+
+        self.status_bar("-- INLINE COMMENT --", h)
 
         if addr in self.dis.user_inline_comments:
-            self.comm = list(self.dis.user_inline_comments[addr])
+            text = self.dis.user_inline_comments[addr]
+        else:
+            text = ""
 
-        self.cursor_x = xbegin + 3
-        i = 0 # index in the string comment
+        is_new_token = addr not in self.dis.user_inline_comments
 
-        self.screen.addstr(h, 0, "-- INLINE COMMENT --")
+        ed = InlineEd(self, h, w, line, xbegin, idx_token, text,
+                      is_new_token, COLOR_USER_COMMENT.val,
+                      self.token_lines[line], prefix="; ")
 
-        while 1:
-            (h, w) = screen.getmaxyx()
-            h -= 1 # status bar
+        ret = ed.start_view(self.screen)
 
-            x = xbegin
-            screen.move(y, xbegin)
+        if ret:
+            self.gctx.db.modified = True
 
-            if x + 3 < w:
-                screen.addstr(y, x, " ; ", col_intern)
-                x += 3
-                if x + len(self.comm) >= w:
-                    screen.addstr("".join(self.comm[:w - x - 1]), col_intern)
-                else:
-                    screen.addstr("".join(self.comm), col_intern)
-            screen.clrtoeol()
+            if ed.text:
+                self.dis.user_inline_comments[addr] = ed.text
+                if is_new_token:
+                    self.output.index_end_inst[line] = \
+                            (xbegin, idx_token)
 
-            # Underline the rest of the line
-            n = w - xbegin - len(self.comm) - 4
-            self.screen.addstr(" " * n, color_pair(0) | curses.A_UNDERLINE)
-
-            if self.cursor_x >= w:
-                self.cursor_x = w - 1
-            screen.move(y, self.cursor_x)
-            k = self.read_escape_keys()
-
-            if k == b"\x1b": # escape = cancel
-                break
-
-            if k in self.inline_mapping:
-                i = self.inline_mapping[k](xbegin, i, w)
-                if k == b"\n":
-                    break
-            elif k[0] >= 32 and k[0] <= 126 and self.cursor_x < w - 1:
-                # TODO: fix self.cursor_x >= w
-                # TODO: utf-8
-                c = chr(k[0])
-                self.comm.insert(i, c)
-                i += 1
-                self.cursor_x += 1
+            elif not is_new_token:
+                del self.dis.user_inline_comments[addr]
 
         return True
-
-
-    def print_line(self, w, i):
-        num_line = self.win_y + i
-        is_current_line = self.cursor_y == i
-        x = 0
-        force_exit = False
-
-        for (string, col, is_bold) in self.token_lines[num_line]:
-            if x + len(string) >= w:
-                string = string[:w-x-1]
-                force_exit = True
-            
-            c = color_pair(col)
-
-            if is_current_line:
-                c |= A_UNDERLINE
-
-            if is_bold:
-                c |= curses.A_BOLD
-
-            self.screen.addstr(i, x, string, c)
-
-            x += len(string)
-            if force_exit:
-                break
-
-        if is_current_line and not force_exit:
-            n = w - x - 1
-            self.screen.addstr(i, x, " " * n, color_pair(0) | A_UNDERLINE)
-            x += n
-
-        self.highlight_search(i, w)
-        self.screen.move(i, x)
-            
-
-    def highlight_search(self, i, w):
-        if self.search is None:
-            return
-        num_line = self.win_y + i
-        start = 0
-        while 1:
-            idx = self.output.lines[num_line].find(self.search, start)
-            if idx == -1 or idx >= w:
-                break
-            self.screen.chgat(i, idx, len(self.search), curses.color_pair(1))
-            start = idx + 1
-
-
-    def scroll_up(self, h, n, page_scroll):
-        if page_scroll:
-            wy = self.win_y - n
-            y = self.cursor_y + n
-            line = self.win_y + self.cursor_y
-
-            wy = self.dump_update_up(wy, h)
-
-            if wy >= 0:
-                self.win_y = wy
-                if y <= h - 3:
-                    if line != len(self.token_lines):
-                        self.cursor_y = y
-                else:
-                    self.cursor_y = h - 4
-            else:
-                self.win_y = 0
-        else:
-            # TODO: find another way
-            for i in range(n):
-                self.dump_update_up(self.win_y, h)
-
-                if self.win_y == 0:
-                    if self.cursor_y == 0:
-                        break
-                    self.cursor_y -= 1
-                else:
-                    if self.cursor_y == 3:
-                        self.win_y -= 1
-                    else:
-                        self.cursor_y -= 1
-
-
-    def scroll_down(self, h, n, page_scroll):
-        if page_scroll:
-            wy = self.win_y + n
-            y = self.cursor_y - n
-
-            self.dump_update_bottom(wy, h)
-
-            if wy > len(self.token_lines) - h:
-                if wy < len(self.token_lines) - 3:
-                    self.win_y = wy
-                else:
-                    self.win_y = len(self.token_lines) - 3 - 1
-                if y >= 3:
-                    self.cursor_y = y
-                else:
-                    self.cursor_y = 3
-            else:
-                self.win_y = wy
-                if y >= 3:
-                    self.cursor_y = y
-                else:
-                    self.cursor_y = 3
-        else:
-            # TODO: find another way
-            for i in range(n):
-                self.dump_update_bottom(self.win_y, h)
-
-                if self.win_y >= len(self.token_lines) - h:
-                    if self.win_y + self.cursor_y == len(self.token_lines) - 1:
-                        break
-                    self.cursor_y += 1
-                else:
-                    if self.cursor_y == h - 4:
-                        self.win_y += 1
-                    else:
-                        self.cursor_y += 1
 
 
     def dump_update_up(self, wy, h):
@@ -501,10 +248,8 @@ class Visual():
 
         ad = self.dis.find_addr_before(self.first_addr)
 
-        self.console.ctx.entry_addr = ad
-        self.console.ctx.dump = True
-        o = self.dis.dump_asm(self.console.ctx, until=self.first_addr)
-        self.console.ctx.dump = False
+        self.ctx = self.gctx.get_addr_context(ad)
+        o = self.ctx.dump_asm(until=self.first_addr)
 
         if o is not None:
             nb_new_lines = len(o.lines)
@@ -551,17 +296,14 @@ class Visual():
         if self.last_addr == self.dis.binary.get_last_addr():
             return
 
-        self.console.ctx.reset_vars()
-
         if self.dis.mem.is_code(self.last_addr):
             inst = self.dis.lazy_disasm(self.last_addr)
-            self.console.ctx.entry_addr = self.last_addr + inst.size
+            ad = self.last_addr + inst.size
         else:
-            self.console.ctx.entry_addr = self.last_addr + 1
+            ad = self.last_addr + 1
 
-        self.console.ctx.dump = True
-        o = self.dis.dump_asm(self.console.ctx, NB_LINES_TO_DISASM)
-        self.console.ctx.dump = False
+        self.ctx = self.gctx.get_addr_context(ad)
+        o = self.ctx.dump_asm()
 
         if o is not None:
             nb_new_lines = len(self.output.lines)
@@ -576,115 +318,8 @@ class Visual():
                 self.output.index_end_inst[nb_new_lines + l] = o.index_end_inst[l]
 
 
-    def check_cursor_x(self):
-        size_line = len(self.output.lines[self.win_y + self.cursor_y])
-        if size_line == 0:
-            self.cursor_x = 0
-        elif self.cursor_x >= size_line:
-            self.cursor_x = size_line - 1
+    # New mapping
 
-
-    # Main view : Keys mapping
-
-    def main_k_left(self, h, w):
-        self.check_cursor_x()
-        if self.cursor_x > 0:
-            self.cursor_x -= 1
-        return False
-
-    def main_k_right(self, h, w):
-        self.cursor_x += 1
-        self.check_cursor_x()
-        return False
-
-    def main_k_down(self, h, w):
-        self.scroll_down(h, 1, False)
-        return True
-
-    def main_k_up(self, h, w):
-        self.scroll_up(h, 1, False)
-        return True
-
-    def main_k_pageup(self, h, w):
-        self.scroll_up(h, h-1, True)
-        return True
-
-    def main_k_pagedown(self, h, w):
-        self.scroll_down(h, h-1, True)
-        return True
-
-    def main_mouse_event(self, k, h, w):
-        button = k[3]
-
-        if button == 0x20:
-            now = time()
-            diff = now - self.time_last_mouse_key
-            diff = int(diff * 1000)
-
-            self.time_last_mouse_key = now
-
-            if diff <= MOUSE_INTERVAL:
-                # double left-click
-                return self. main_cmd_enter(h, w)
-
-        if button == 0x20: # simple left-click
-            self.cursor_x = k[4] - 33
-            self.goto_line(self.win_y + k[5] - 33, h)
-            self.main_cmd_highlight_current_word(h, w)
-            self.check_cursor_x()
-        elif button == 0x60: # scroll up
-            self.scroll_up(h, 3, True)
-        elif button == 0x61: # scroll down
-            self.scroll_down(h, 3, True)
-
-        return True
-
-    def main_k_home(self, h, w):
-        # TODO: fix self.cursor_x >= w
-        if self.cursor_x == 0:
-            line = self.output.lines[self.win_y + self.cursor_y]
-            while self.cursor_x < len(line):
-                if line[self.cursor_x] != " ":
-                    break
-                self.cursor_x += 1
-        else:
-            self.cursor_x = 0
-        return False
-
-    def main_k_end(self, h, w):
-        # TODO: fix self.cursor_x >= w
-        size_line = len(self.output.lines[self.win_y + self.cursor_y])
-        if size_line >= w:
-            self.cursor_x = w - 1
-        elif size_line > 0:
-            self.cursor_x = size_line - 1
-        else:
-            self.cursor_x = 0
-        return False
-
-    def main_k_ctrl_right(self, h, w):
-        # TODO: fix self.cursor_x >= w
-        line = self.output.lines[self.win_y + self.cursor_y]
-        x = self.cursor_x
-        while x < len(line) and line[x] == " " and x < w:
-            x += 1
-        while x < len(line) and line[x] != " " and x < w:
-            x += 1
-        self.cursor_x = x
-
-    def main_k_ctrl_left(self, h, w):
-        line = self.output.lines[self.win_y + self.cursor_y]
-        x = self.cursor_x
-        if x == 0:
-            return
-        x -= 1
-        while x > 0 and line[x] == " ":
-            x -= 1
-        while x > 0 and line[x] != " ":
-            x -= 1
-        if x != 0:
-            x += 1
-        self.cursor_x = x
 
     def main_k_prev_paragraph(self, h, w):
         l = self.win_y + self.cursor_y - 1
@@ -713,22 +348,20 @@ class Visual():
         return True
 
 
-    def main_cmd_top(self, h, w):
+    def main_k_top(self, h, w):
         self.stack.append(self.__compute_curr_position())
         self.saved_stack.clear()
-
-        self.cursor_y = 0
-        self.win_y = 0
-        self.cursor_x = 0
 
         if self.mode == MODE_DUMP:
             top = self.dis.binary.get_first_addr()
             if self.first_addr != top:
                 self.exec_disasm(top, h)
+
+        Window.k_top(self, h, w)
         return True
 
 
-    def main_cmd_bottom(self, h, w):
+    def main_k_bottom(self, h, w):
         self.stack.append(self.__compute_curr_position())
         self.saved_stack.clear()
 
@@ -742,12 +375,7 @@ class Visual():
                 self.win_y = 0
                 self.cursor_y = 0
 
-        if self.win_y >= len(self.token_lines) - h:
-            self.cursor_y += len(self.token_lines) - \
-                             self.win_y - self.cursor_y - 1
-        else:
-            self.cursor_y = h - 1
-            self.win_y = len(self.token_lines) - h
+        Window.k_bottom(self, h, w)
         return True
 
 
@@ -800,18 +428,10 @@ class Visual():
         return True
 
 
-    def main_cmd_highlight_current_word(self, h, w):
-        w = self.get_word_under_cursor()
-        if w is None:
-            return False
-        self.search = w
-        return True
-
-
     def __compute_curr_position(self):
         line = self.win_y + self.cursor_y
         if self.mode == MODE_DECOMPILE:
-            last = self.console.ctx.entry_addr
+            last = self.ctx.entry
             offset_y = (self.win_y, self.cursor_y)
         else:
             # We save only addresses on the stack, so if the cursor is
@@ -832,27 +452,22 @@ class Visual():
 
         topush = self.__compute_curr_position()
 
-        if word.startswith("0x"):
-            try:
-                ad = int(word, 16)
-            except:
-                return False
+        ctx = self.gctx.get_addr_context(word)
+        if not ctx:
+            return False
 
-        elif word in self.console.ctx.labels:
-            ad = self.console.ctx.labels[word]
-
-        else:
-            self.console.ctx.entry = word
-            if not init_entry_addr(self.console.ctx):
-                return False
-            ad = self.console.ctx.entry_addr
-
+        ad = ctx.entry
         self.cursor_x = 0
 
         if self.goto_address(ad, h, w):
             self.saved_stack.clear()
             self.stack.append(topush)
             return True
+
+        self.ctx = ctx
+
+        if self.mode == MODE_DECOMPILE and not self.dis.mem.is_code(ad):
+            self.mode = MODE_DUMP
 
         ret = self.exec_disasm(ad, h)
         if ret:
@@ -869,13 +484,16 @@ class Visual():
         self.cursor_x = x
 
         if mode == MODE_DECOMPILE:
-            self.win_y = offset_y[0]
-            self.cursor_y = offset_y[1]
-            if self.mode == MODE_DECOMPILE and ad == self.console.ctx.entry_addr:
+            line = offset_y[0] + offset_y[1]
+
+            if self.mode == MODE_DECOMPILE and ad == self.ctx.entry:
+                self.goto_line(line, h)
+                self.cursor_x = x
                 return True
 
             self.mode = mode
             ret = self.exec_disasm(ad, h)
+            self.goto_line(line, h)
 
         else:
             if self.mode == MODE_DUMP and self.goto_address(ad, h, w):
@@ -910,49 +528,44 @@ class Visual():
         return self.__do_go_back(poped, h, w)
 
 
-    def main_cmd_highlight_clear(self, h, w):
-        self.search = None
-        return True
-
-
     def main_cmd_switch_mode(self, h, w):
         self.stack.append(self.__compute_curr_position())
 
+        # Get a line with an address: the cursor is maybe on a comment
+        l = self.win_y + self.cursor_y
+        while l not in self.output.line_addr and l <= len(self.token_lines):
+            l += 1
+
+        ad = self.output.line_addr[l]
+
         if self.mode == MODE_DUMP:
+            func_id = self.dis.mem.get_func_id(ad)
+
+            if func_id == -1:
+                self.status_bar("not in a function: create a function or use "
+                                "the cmd x in the console", h, True)
+                return False
+
+            ad_disasm = self.dis.func_id[func_id]
             self.mode = MODE_DECOMPILE
+
         else:
+            ad_disasm = self.ctx.entry
             self.mode = MODE_DUMP
 
-        # This is for moving the cursor at the same address
-        l = self.win_y + self.cursor_y
-        while l not in self.output.line_addr and l > 0:
-            l -= 1
-        if l == 0:
-            ad = self.first_addr
-        else:
-            ad = self.output.line_addr[l]
-
-        ret = self.exec_disasm(ad, h)
+        ret = self.exec_disasm(ad_disasm, h)
 
         if ret:
             self.cursor_x = 0
-
-            if self.mode == MODE_DUMP:
-                self.goto_address(ad, h, w)
-            else:
-                self.win_y = 0
-                self.cursor_y = 0
+            self.win_y = 0
+            self.cursor_y = 0
+            self.goto_address(ad, h, w)
 
         return ret
 
 
-    def reload_dump(self):
-        self.console.ctx.entry_addr = self.first_addr
-        self.console.ctx.dump = True
-        o = self.dis.dump_asm(self.console.ctx, until=self.last_addr)
-        self.console.ctx.dump = False
-        self.output = o
-        self.token_lines = o.token_lines
+    def reload_output(self, h):
+        self.exec_disasm(self.first_addr, h, dump_until=self.last_addr)
 
 
     def main_cmd_code(self, h, w):
@@ -968,10 +581,10 @@ class Visual():
         if self.dis.mem.is_code(ad):
             return False
 
-        self.console.analyzer.msg.put((ad, False, self.queue_wait_analyzer))
+        self.analyzer.msg.put((ad, False, self.queue_wait_analyzer))
         self.queue_wait_analyzer.get()
-        self.reload_dump()
-        self.console.ctx.db.modified = True
+        self.reload_output(h)
+        self.gctx.db.modified = True
         return True
 
 
@@ -986,118 +599,78 @@ class Visual():
         # TODO: check if the address is not already in a function
 
         ad = self.output.line_addr[line]
-        self.console.analyzer.msg.put((ad, True, self.queue_wait_analyzer))
+        self.analyzer.msg.put((ad, True, self.queue_wait_analyzer))
         self.queue_wait_analyzer.get()
-        self.reload_dump()
-        self.console.ctx.db.modified = True
+        self.reload_output(h)
+        self.gctx.db.modified = True
         self.goto_address(ad, h, w)
         return True
 
 
-    # Inline comment editor : keys mapping
+    def main_cmd_xrefs(self, h, w):
+        word = self.get_word_under_cursor()
+        if word is None:
+            return False
 
-    def inline_k_left(self, xbegin, i, w):
-        if i != 0:
-            i -= 1
-            self.cursor_x -= 1
-        return i
+        ctx = self.gctx.get_addr_context(word)
+        if not ctx:
+            return False
 
-    def inline_k_right(self, xbegin, i, w):
-        if i != len(self.comm):
-            i += 1
-            self.cursor_x += 1
-            # TODO: fix self.cursor_x >= w
-            if self.cursor_x >= w:
-                i -= self.cursor_x - w + 1
-                self.cursor_x = w - 1
-        return i
+        if ctx.entry not in self.dis.xrefs:
+            self.status_bar("no xrefs", h, True)
+            return False
 
-    def inline_k_backspace(self, xbegin, i, w):
-        if i != 0:
-            del self.comm[i-1]
-            i -= 1
-            self.cursor_x -= 1
-        return i
+        h2 = int(h*3/4)
+        w2 = int(w*6/7)
 
-    def inline_k_home(self, xbegin, i, w):
-        self.cursor_x = xbegin + 3 # 3 for " ; "
-        return 0
+        x = int((w - w2)/2) - 1
+        y = int((h - h2)/2) - 1
 
-    def inline_k_end(self, xbegin, i, w):
-        n = len(self.comm)
-        self.cursor_x = xbegin + 3 + n
-        i = n
-        # TODO: fix self.cursor_x >= w
-        if self.cursor_x >= w:
-            i -= self.cursor_x - w + 1
-            self.cursor_x = w - 1
-        return i
+        # A background with borders
+        scr_borders = curses.newwin(h2 + 2, w2 + 2, y, x)
+        scr_borders.border()
+        title = " xrefs for " + hex(ctx.entry)
+        scr_borders.addstr(0, int((w2 - len(title))/2), title)
+        scr_borders.refresh()
 
-    def inline_k_delete(self, xbegin, i, w):
-        if i != len(self.comm):
-            del self.comm[i]
-        return i
+        # The message box with xrefs
+        o = ctx.dump_xrefs()
+        scr = curses.newwin(h2, w2, y + 1, x + 1)
+        w = Window(o)
+        ret = w.start_view(scr)
 
-    def inline_k_enter(self, xbegin, i, w):
-        line = self.win_y + self.cursor_y
-        addr = self.output.line_addr[line]
-        lines = self.output.lines
+        if not ret:
+            return True
 
-        xbegin, idx_token = self.output.index_end_inst[line]
+        # Goto the selected xref
 
-        if addr in self.dis.user_inline_comments:
-            is_new_comment = False
-            # Extract the comment which starts by #
-            instr_comm = lines[line][xbegin + 3 + len(self.comm) + 1:]
-        else:
-            is_new_comment = True
-            instr_comm = lines[line][xbegin + 1:]
+        ad = o.line_addr[w.win_y + w.cursor_y]
+        topush = self.__compute_curr_position()
+        self.cursor_x = 0
 
-        if not self.comm:
-            if not is_new_comment:
-                del self.dis.user_inline_comments[addr]
+        if self.goto_address(ad, h, w):
+            self.saved_stack.clear()
+            self.stack.append(topush)
+            return True
 
-                lines[line] = "".join([
-                    lines[line][:xbegin],
-                    " ",
-                    instr_comm])
+        ad_disasm = ad
 
-                # Remove space and comment
-                del self.token_lines[line][idx_token]
-                del self.token_lines[line][idx_token]
-        else:
-            self.comm = "".join(self.comm)
-            self.dis.user_inline_comments[addr] = self.comm
-
-            if is_new_comment:
-                # Space token
-                self.token_lines[line].insert(idx_token,
-                        (" ", 0, False))
-
-                # Insert the new token
-                self.token_lines[line].insert(idx_token + 1,
-                        ("; " + self.comm, COLOR_USER_COMMENT.val, False))
-
-                self.output.index_end_inst[line] = \
-                        (xbegin, idx_token)
+        if self.mode == MODE_DECOMPILE:
+            func_id = self.dis.mem.get_func_id(ad)
+            if func_id == -1:
+                self.mode = MODE_DUMP
             else:
-                # Plus 1 for the space token
-                self.token_lines[line][idx_token + 1] = \
-                        ("; " + self.comm, COLOR_USER_COMMENT.val, False)
+                ad_disasm = self.dis.func_id[func_id]
 
-            lines[line] = "".join([
-                lines[line][:xbegin],
-                " ; ",
-                self.comm,
-                " ",
-                instr_comm])
-        return i
+        ret = self.exec_disasm(ad_disasm, h)
+        if ret:
+            self.cursor_y = 0
+            self.win_y = 0
+            self.saved_stack.clear()
+            self.stack.append(topush)
+            self.goto_address(ad, h, w)
+        return ret
 
-    def inline_k_ctrl_u(self, xbegin, i, w):
-        self.comm = self.comm[i:]
-        self.cursor_x = xbegin + 3 # 3 for " ; "
-        return 0
 
-    def inline_k_ctrl_k(self, xbegin, i, w):
-        self.comm = self.comm[:i]
-        return i
+    def mouse_double_left_click(self, h, w):
+        return self.main_cmd_enter(h, w)

@@ -20,6 +20,7 @@
 import os
 import gc
 import sys
+import zlib
 
 try:
     import msgpack
@@ -31,12 +32,11 @@ except:
 import json
 
 from lib.disassembler import Jmptable
-from lib.utils import info, error, die, warning
-from lib.fileformat.binary import SYM_UNK, SYM_FUNC
+from lib.utils import info, warning
 from lib.memory import Memory
 
 
-VERSION = 1.1
+VERSION = 1.7
 
 
 class Database():
@@ -49,7 +49,7 @@ class Database():
 
     def __init_vars(self):
         self.history = []
-        self.symbols = {}
+        self.symbols = {} # name -> [addr, type]
         self.user_inline_comments = {}
         self.internal_inline_comments = {}
         self.user_previous_comments = {}
@@ -59,13 +59,15 @@ class Database():
         self.modified = False
         self.loaded = False
         self.mem = None
-        self.functions = {}
+        self.functions = {} # func address -> [end addr, flags]
+        self.func_id = {} # id -> func address
+        self.xrefs = {} # addr -> list addr
+        self.imports = {} # ad -> True (the bool is just for msgpack to save the database)
 
         # Computed variables
         self.func_id_counter = 0
-        self.func_id = {} # id -> func address
         self.end_functions = {}
-        self.reverse_symbols = {}
+        self.reverse_symbols = {} # addr -> [name, type]
         self.version = VERSION
 
 
@@ -85,16 +87,27 @@ class Database():
 
             data = self.__check_old_json_db(fd)
             if data is None:
-                data = msgpack.unpackb(fd.read(), encoding="utf-8")
+                data = fd.read()
+                if data.startswith(b"ZLIB"):
+                    data = zlib.decompress(data[4:])
+                data = msgpack.unpackb(data, encoding="utf-8")
                 fd.close()
 
             self.__load_meta(data)
+            self.__load_memory(data)
             self.__load_symbols(data)
             self.__load_jmptables(data)
             self.__load_comments(data)
-            self.__load_memory(data)
             self.__load_functions(data)
             self.__load_history(data)
+            self.__load_xrefs(data)
+            self.__load_imports(data)
+
+            if self.version <= 1.5:
+                self.__load_labels(data)
+
+            if self.version != VERSION:
+                warning("the database version is old, some information may be missing")
 
             self.loaded = True
 
@@ -103,6 +116,7 @@ class Database():
 
     def save(self, history):
         data = {
+            "version": VERSION,
             "symbols": self.symbols,
             "history": history,
             "user_inline_comments": self.user_inline_comments,
@@ -111,8 +125,10 @@ class Database():
             "internal_previous_comments": self.internal_previous_comments,
             "jmptables": [],
             "mips_gp": self.mips_gp,
-            "mem_code": self.mem.code,
+            "mem": self.mem.mm,
             "functions": self.functions,
+            "func_id": self.func_id,
+            "xrefs": self.xrefs,
         }
 
         for j in self.jmptables.values():
@@ -125,15 +141,35 @@ class Database():
             data["jmptables"].append(o)
 
         fd = open(self.path, "wb+")
-        fd.write(msgpack.packb(data, use_bin_type=True))
+        fd.write(b"ZLIB")
+        fd.write(zlib.compress(msgpack.packb(data, use_bin_type=True)))
         fd.close()
 
 
     def __load_symbols(self, data):
         self.symbols = data["symbols"]
-        for name, a in self.symbols.items():
-            self.reverse_symbols[a[0]] = [name, a[1]]
-            self.symbols[name] = [a[0], a[1]]
+
+        if self.version <= 1.4 and self.version != -1:
+            for name, a in self.symbols.items():
+                self.reverse_symbols[a[0]] = name
+                self.symbols[name] = a[0]
+                self.mem.add(a[0], 1, a[1])
+            return
+
+        for name, ad in self.symbols.items():
+            self.reverse_symbols[ad] = name
+            self.symbols[name] = ad
+
+
+    def __load_labels(self, data):
+        try:
+            for name, ad in self.labels.items():
+                self.reverse_symbols[ad] = name
+                self.symbols[name] = ad
+        except:
+            # Not available in previous versions, this try will be
+            # removed in the future
+            pass
 
 
     def __load_comments(self, data):
@@ -167,6 +203,7 @@ class Database():
         except:
             # Not available in previous versions, this try will be
             # removed in the future
+            self.version = -1
             pass
 
 
@@ -174,7 +211,13 @@ class Database():
         self.mem = Memory()
 
         try:
-            self.mem.code = data["mem_code"]
+            if self.version == -1:
+                self.mem.mm = data["mem_code"]
+                for ad in self.mem.mm:
+                    self.mem.mm[ad].append(-1)
+                return
+
+            self.mem.mm = data["mem"]
         except:
             # Not available in previous versions, this try will be
             # removed in the future
@@ -185,37 +228,53 @@ class Database():
         self.history = data["history"]
 
 
+    def __load_xrefs(self, data):
+        try:
+            self.xrefs = data["xrefs"]
+        except:
+            # Not available in previous versions, this try will be
+            # removed in the future
+            pass
+
+
+    def __load_imports(self, data):
+        try:
+            self.imports = data["imports"]
+        except:
+            # Not available in previous versions, this try will be
+            # removed in the future
+            pass
+
+
     def __load_functions(self, data):
         try:
             self.functions = data["functions"]
 
-            if self.version == 1.0:
-                self.end_functions = data["end_functions"]
+            if self.version <= 1.6:
+                for fad, value in self.functions.items():
+                    value.append(0) # flags
 
-                tmp_rev_func_id = {}
+                    # end of the function
+                    e = value[0]
+                    if e in self.end_functions:
+                        self.end_functions[e].append(fad)
+                    else:
+                        self.end_functions[e] = [fad]
 
-                for fad in self.functions:
-                    self.func_id[self.func_id_counter] = fad
-                    self.tmp_rev_func_id[fad] = self.func_id_counter
-                    self.func_id_counter += 1
+                    # function id
+                    id = value[1]
+                    self.func_id[id] = fad
 
-                for e in self.end_functions:
-                    for fad in e:
-                        self.functions[fad] = [e, self.tmp_rev_func_id[fad]]
+            else:
+                for fad, value in self.functions.items():
+                    # end of the function
+                    e = value[0]
+                    if e in self.end_functions:
+                        self.end_functions[e].append(fad)
+                    else:
+                        self.end_functions[e] = [fad]
 
-                return
-
-            for fad, value in self.functions.items():
-                # end of the function
-                e = value[0]
-                if e in self.end_functions:
-                    self.end_functions[e].append(fad)
-                else:
-                    self.end_functions[e] = [fad]
-
-                # function id
-                id = value[1]
-                self.func_id[id] = fad
+                self.func_id = data["func_id"]
 
             self.func_id_counter = max(self.func_id) + 1
 
@@ -244,10 +303,6 @@ class Database():
 
             data["internal_inline_comments"] = {}
             data["internal_previous_comments"] = {}
-
-            ptr = data["symbols"]
-            for name, ad in ptr.items():
-                ptr[name] = [ad, SYM_UNK]
 
             return data
         return None

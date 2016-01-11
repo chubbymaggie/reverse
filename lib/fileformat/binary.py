@@ -29,9 +29,6 @@ T_BIN_PE  = 1
 T_BIN_RAW = 2
 T_BIN_UNK = 3
 
-SYM_UNK = 0
-SYM_FUNC = 1
-
 
 class SectionAbs():
     # virt_size: size of the mapped section in memory
@@ -116,11 +113,12 @@ class SectionAbs():
 
 
 class Binary(object):
-    def __init__(self, filename, raw_type=None, raw_base=None, raw_big_endian=None):
+    def __init__(self, mem, filename, raw_type=None, raw_base=None, raw_big_endian=None):
         self.__binary = None
-        self.reverse_symbols = {} # ad -> [name, type]
-        self.symbols = {} # name -> [ad, type]
+        self.reverse_symbols = {} # ad -> name
+        self.symbols = {} # name -> ad
         self.section_names = {}
+        self.imports = {} # ad -> True (the bool is just for msgpack to save the database)
         self.type = None
 
         self._abs_sections = {} # start section -> SectionAbs
@@ -138,10 +136,10 @@ class Binary(object):
 
         if self.type == T_BIN_ELF:
             import lib.fileformat.elf as LIB_ELF
-            self.__binary = LIB_ELF.ELF(self, filename)
+            self.__binary = LIB_ELF.ELF(mem, self, filename)
         elif self.type == T_BIN_PE:
             import lib.fileformat.pe as LIB_PE
-            self.__binary = LIB_PE.PE(self, filename)
+            self.__binary = LIB_PE.PE(mem, self, filename)
         else:
             raise ExcFileFormat()
 
@@ -295,5 +293,18 @@ class Binary(object):
 
 
     # Only for PE !
-    def pe_reverse_stripped_symbols(self, dis, addr_to_analyze):
-        return self.__binary.pe_reverse_stripped_symbols(dis, addr_to_analyze)
+
+
+    def pe_reverse_stripped(self, dis, i):
+        return self.__binary.pe_reverse_stripped(dis, i)
+
+
+    def pe_reverse_stripped_list(self, dis, addr_to_analyze):
+        count = 0
+        for ad in addr_to_analyze:
+            i = dis.lazy_disasm(ad)
+            if i is None:
+                continue
+            if self.__binary.pe_reverse_stripped(dis, i):
+                count += 1
+        return count

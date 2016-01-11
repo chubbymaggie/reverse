@@ -26,7 +26,6 @@ from lib.ast import (Ast_Branch, Ast_Goto, Ast_Loop, Ast_IfGoto, Ast_Ifelse,
         Ast_AndIf)
 from lib.arch.x86.output import ASSIGNMENT_OPS
 from lib.arch.x86.utils import is_uncond_jump, is_call
-from lib.fileformat.binary import SYM_FUNC
 
 
 FUSE_OPS = set(ASSIGNMENT_OPS)
@@ -41,7 +40,8 @@ def assign_colors(ctx, ast):
     if isinstance(ast, Ast_Branch):
         for n in ast.nodes:
             if isinstance(n, list):
-                if is_uncond_jump(n[0]) and n[0].operands[0].type == X86_OP_IMM:
+                if is_uncond_jump(n[0]) and n[0].operands[0].type == X86_OP_IMM and \
+                        n[0].address in ctx.gph.link_out:
                     nxt = ctx.gph.link_out[n[0].address][BRANCH_NEXT]
                     pick_color(nxt)
             else: # ast
@@ -119,9 +119,9 @@ def search_local_vars(ctx, ast):
 
 def search_canary_plt(ctx, ast):
     fname = "__stack_chk_fail@plt"
-    if fname not in ctx.dis.binary.symbols:
+    if fname not in ctx.gctx.dis.binary.symbols:
         return
-    faddr = ctx.dis.binary.symbols[fname][0]
+    faddr = ctx.gctx.dis.binary.symbols[fname]
     __rec_search_canary_plt(faddr, ctx, ast, [])
 
 

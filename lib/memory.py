@@ -19,18 +19,60 @@
 
 MEM_UNK = 1
 MEM_CODE = 2
+MEM_FUNC = 3
 
 
 class Memory():
     def __init__(self):
-        self.code = {}
+        #
+        # Each item contains a list :
+        # [size, type, value]
+        #
+        # type == MEM_CODE
+        # the value is the function id where the instruction is.
+        #
+
+        self.mm = {}
 
 
-    def add(self, ad, size, ty=MEM_CODE):
-        self.code[ad] = (size, ty)
+    def add(self, ad, size, ty, val=0):
+        self.mm[ad] = [size, ty, val]
+
+
+    def type(self, ad, ty):
+        self.mm[ad][1] = ty
 
 
     def is_code(self, ad):
-        if ad in self.code:
-            return self.code[ad][1] == MEM_CODE
+        if ad in self.mm:
+            ty = self.mm[ad][1]
+            return ty == MEM_CODE or ty == MEM_FUNC
         return False
+
+
+    def is_func(self, ad):
+        if ad in self.mm:
+            return self.mm[ad][1] == MEM_FUNC
+        return False
+
+
+    def is_loc(self, ad):
+        if ad in self.mm:
+            return self.mm[ad][1] == MEM_CODE
+        return False
+
+
+    def get_func_id(self, ad):
+        if not self.is_code(ad):
+            return -1
+        return self.mm[ad][2]
+
+
+    def get_type(self, ad):
+        if ad in self.mm:
+            return self.mm[ad][1]
+        return -1
+
+
+    def exists(self, ad):
+        return ad in self.mm

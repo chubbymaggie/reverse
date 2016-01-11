@@ -21,8 +21,8 @@ from capstone.mips import (MIPS_OP_IMM, MIPS_OP_MEM, MIPS_OP_REG,
         MIPS_OP_INVALID, MIPS_INS_LW, MIPS_INS_SW, MIPS_INS_AND,
         MIPS_INS_LUI, MIPS_INS_MOVE, MIPS_INS_ADD, MIPS_INS_ADDU,
         MIPS_INS_ADDIU, MIPS_INS_LB, MIPS_INS_LBU, MIPS_INS_SB,
-        MIPS_INS_SLL, MIPS_INS_SRA, MIPS_INS_SRL, MIPS_INS_XOR,
-        MIPS_INS_XORI, MIPS_INS_SUB, MIPS_INS_SUBU, MIPS_INS_BGTZ,
+        MIPS_INS_SLL, MIPS_INS_SRA, MIPS_INS_SRL, MIPS_INS_SUB,
+        MIPS_INS_SUBU, MIPS_INS_BGTZ,
         MIPS_INS_BGEZ, MIPS_INS_BNEZ, MIPS_INS_BEQZ, MIPS_INS_BLEZ,
         MIPS_INS_BLTZ, MIPS_REG_ZERO, MIPS_REG_GP)
 
@@ -70,7 +70,7 @@ class Output(OutputAbs):
         op = i.operands[num_op]
 
         if op.type == MIPS_OP_IMM:
-            return self._imm(i, op.value.imm, 4, hexa,
+            return self._imm(op.value.imm, 4, hexa,
                              force_dont_print_data=force_dont_print_data)
 
         elif op.type == MIPS_OP_REG:
@@ -83,20 +83,20 @@ class Output(OutputAbs):
 
             printed = False
 
-            if mm.base == MIPS_REG_GP and self.ctx.dis.mips_gp != -1:
-                ad = self.ctx.dis.mips_gp + mm.disp
-                section = self.binary.get_section(ad)
+            if mm.base == MIPS_REG_GP and self._dis.mips_gp != -1:
+                ad = self._dis.mips_gp + mm.disp
+                section = self._binary.get_section(ad)
 
                 if section is not None:
                     val = section.read_int(ad, 4)
-                    if val in self.binary.reverse_symbols:
-                        self._imm(i, val, 0, True, print_data=False,
+                    if self.is_label(val):
+                        self._imm(val, 0, True, print_data=False,
                                   force_dont_print_data=force_dont_print_data)
                         return True
 
                 if show_deref:
                     self._add("*(")
-                self._imm(i, ad, 0, True, section=section, print_data=False,
+                self._imm(ad, 0, True, section=section, print_data=False,
                           force_dont_print_data=force_dont_print_data)
                 if show_deref:
                     self._add(")")
@@ -110,13 +110,13 @@ class Output(OutputAbs):
                 printed = True
 
             if mm.disp != 0:
-                section = self.binary.get_section(mm.disp)
-                is_sym = mm.disp in self.binary.reverse_symbols
+                section = self._binary.get_section(mm.disp)
+                is_label = self.is_label(mm.disp)
 
-                if is_sym or section is not None:
+                if is_label or section is not None:
                     if printed:
                         self._add(" + ")
-                    self._imm(i, mm.disp, 0, True,
+                    self._imm(mm.disp, 0, True,
                               section=section, print_data=False,
                               force_dont_print_data=force_dont_print_data)
                 else:
@@ -176,9 +176,6 @@ class Output(OutputAbs):
 
 
     def _sub_asm_inst(self, i, tab=0, prefix=""):
-        self._label_and_address(i.address, tab)
-        self._bytes(i)
-
         if is_ret(i):
             self._retcall(self.get_inst_str(i))
             return False
@@ -186,6 +183,16 @@ class Output(OutputAbs):
         if is_call(i):
             self._retcall(i.mnemonic)
             self._add(" ")
+
+            if self.gctx.sectionsname:
+                op = i.operands[0]
+                if op.type == MIPS_OP_IMM:
+                    s = self._binary.get_section(op.value.imm)
+                    if s is not None:
+                        self._add("(")
+                        self._section(s.name)
+                        self._add(") ")
+
             self._operand(i, 0, hexa=True, force_dont_print_data=True)
             return False
 
@@ -204,71 +211,64 @@ class Output(OutputAbs):
             if i.operands[-1].type != MIPS_OP_IMM:
                 self._operand(i, -1, force_dont_print_data=True)
                 self.inst_end_here()
-                if is_uncond_jump(i) and self.ctx.comments and not self.ctx.dump \
-                        and not i.address in self.ctx.dis.jmptables:
+                if is_uncond_jump(i) and not self.ctx.is_dump \
+                        and not i.address in self._dis.jmptables:
                     self._add(" ")
                     self._comment("# STOPPED")
                 return False
 
-            addr = i.operands[-1].value.imm
-
-            if self.is_symbol(addr):
-                self._symbol(addr)
-            else:
-                if addr in self.ctx.addr_color:
-                    self._label_or_address(addr, -1, False)
-                else:
-                    self._add(hex(addr))
+            self._operand(i, -1, hexa=True, force_dont_print_data=True)
             return False
 
 
         modified = False
 
-        if i.id in LD_CHECK:
-            self._operand(i, 0)
-            self._add(" = (")
-            self._type(LD_TYPE[i.id])
-            self._add(") ")
-            self._operand(i, 1)
-            modified = True
-
-        elif i.id in ST_CHECK:
-            self._operand(i, 1)
-            self._add(" = (")
-            self._type(ST_TYPE[i.id])
-            self._add(") ")
-            self._operand(i, 0)
-            modified = True
-
-        elif i.id in INST_CHECK:
-            if i.id == MIPS_INS_LUI:
-                self._add("(load upper) ")
+        if self.gctx.capstone_string:
+            if i.id in LD_CHECK:
                 self._operand(i, 0)
-                self._add(" = ")
+                self._add(" = (")
+                self._type(LD_TYPE[i.id])
+                self._add(") ")
                 self._operand(i, 1)
+                modified = True
 
-            elif i.id == MIPS_INS_MOVE:
+            elif i.id in ST_CHECK:
+                self._operand(i, 1)
+                self._add(" = (")
+                self._type(ST_TYPE[i.id])
+                self._add(") ")
                 self._operand(i, 0)
-                self._add(" = ")
-                if i.operands[1].value.reg == MIPS_REG_ZERO:
-                    self._add("0")
-                else:
-                    self._operand(i, 1)
+                modified = True
 
-            else:
-                self._operand(i, 0)
-                if i.operands[0].type == i.operands[1].type == MIPS_OP_REG and \
-                    i.operands[0].value.reg == i.operands[1].value.reg:
-                    self._add(" " + inst_symbol(i) + "= ")
-                else:
+            elif i.id in INST_CHECK:
+                if i.id == MIPS_INS_LUI:
+                    self._add("(load upper) ")
+                    self._operand(i, 0)
                     self._add(" = ")
                     self._operand(i, 1)
-                    self._add(" " + inst_symbol(i) + " ")
-                self._operand(i, 2)
 
-            modified = True
+                elif i.id == MIPS_INS_MOVE:
+                    self._operand(i, 0)
+                    self._add(" = ")
+                    if i.operands[1].value.reg == MIPS_REG_ZERO:
+                        self._add("0")
+                    else:
+                        self._operand(i, 1)
 
-        else:
+                else:
+                    self._operand(i, 0)
+                    if i.operands[0].type == i.operands[1].type == MIPS_OP_REG and \
+                        i.operands[0].value.reg == i.operands[1].value.reg:
+                        self._add(" " + inst_symbol(i) + "= ")
+                    else:
+                        self._add(" = ")
+                        self._operand(i, 1)
+                        self._add(" " + inst_symbol(i) + " ")
+                    self._operand(i, 2)
+
+                modified = True
+
+        if not modified:
             self._add("%s " % i.mnemonic)
             if len(i.operands) > 0:
                 modified = self._operand(i, 0)

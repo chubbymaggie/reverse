@@ -107,7 +107,7 @@ class Output(OutputAbs):
             self._add("(")
 
         if op.type == ARM_OP_IMM:
-            return self._imm(i, op.value.imm, 4, hexa,
+            return self._imm(op.value.imm, 4, hexa,
                              force_dont_print_data=force_dont_print_data)
 
         elif op.type == ARM_OP_REG:
@@ -136,19 +136,19 @@ class Output(OutputAbs):
                     # return True
                 if mm.base == ARM_REG_PC:
                     ad = i.address + i.size * 2 + mm.disp
-                    section = self.binary.get_section(ad)
+                    section = self._binary.get_section(ad)
 
                     if section is not None:
                         val = section.read_int(ad, 4)
-                        if val in self.binary.reverse_symbols:
-                            self._imm(i, val, 0, True,
+                        if self.is_label(val):
+                            self._imm(val, 0, True,
                                       section=section, print_data=False,
                                       force_dont_print_data=force_dont_print_data)
                             return True
 
                     if show_deref:
                         self._add("*(")
-                    self._imm(i, ad, 4, True, print_data=False,
+                    self._imm(ad, 4, True, print_data=False,
                               force_dont_print_data=force_dont_print_data)
                     if show_deref:
                         self._add(")")
@@ -181,14 +181,14 @@ class Output(OutputAbs):
                 printed = True
 
             if mm.disp != 0:
-                section = self.binary.get_section(mm.disp)
-                is_sym = mm.disp in self.binary.reverse_symbols
+                section = self._binary.get_section(mm.disp)
+                is_label = self.is_label(mm.disp)
 
-                if is_sym or section is not None:
+                if is_label or section is not None:
                     if printed:
                         self._add(" + ")
                     # is_data=False : don't print string next to the symbol
-                    self._imm(i, mm.disp, 0, True, section=section, print_data=False,
+                    self._imm(mm.disp, 0, True, section=section, print_data=False,
                               force_dont_print_data=force_dont_print_data)
                 else:
                     if printed:
@@ -233,9 +233,6 @@ class Output(OutputAbs):
 
 
     def _sub_asm_inst(self, i, tab=0, prefix=""):
-        self._label_and_address(i.address, tab)
-        self._bytes(i)
-
         if is_ret(i):
             self._retcall(self.get_inst_str(i))
             return False
@@ -243,6 +240,16 @@ class Output(OutputAbs):
         if is_call(i):
             self._retcall(i.mnemonic)
             self._add(" ")
+
+            if self.gctx.sectionsname:
+                op = i.operands[0]
+                if op.type == ARM_OP_IMM:
+                    s = self._binary.get_section(op.value.imm)
+                    if s is not None:
+                        self._add("(")
+                        self._section(s.name)
+                        self._add(") ")
+
             self._operand(i, 0, hexa=True, force_dont_print_data=True)
             return False
 
@@ -257,59 +264,52 @@ class Output(OutputAbs):
             if i.operands[0].type != ARM_OP_IMM:
                 self._operand(i, 0, force_dont_print_data=True)
                 self.inst_end_here()
-                if is_uncond_jump(i) and self.ctx.comments and not self.ctx.dump \
-                        and not i.address in self.ctx.dis.jmptables:
+                if is_uncond_jump(i) and not self.ctx.is_dump \
+                        and not i.address in self._dis.jmptables:
                     self._add(" ")
                     self._comment("# STOPPED")
                 return False
 
-            addr = i.operands[0].value.imm
-
-            if self.is_symbol(addr):
-                self._symbol(addr)
-            else:
-                if addr in self.ctx.addr_color:
-                    self._label_or_address(addr, -1, False)
-                else:
-                    self._add(hex(addr))
+            self._operand(i, 0, hexa=True, force_dont_print_data=True)
             return False
 
 
         modified = False
 
-        if i.id in LDR_CHECK:
-            self._operand(i, 0)
-            self._add(" = (")
-            self._type(LDR_TYPE[i.id])
-            self._add(") ")
-            self._operand(i, 1)
-            modified = True
-
-        elif i.id in STR_CHECK:
-            self._operand(i, 1)
-            self._add(" = (")
-            self._type(STR_TYPE[i.id])
-            self._add(") ")
-            self._operand(i, 0)
-            modified = True
-
-        elif i.id in INST_CHECK:
-            self._operand(i, 0)
-
-            if i.id == ARM_INS_CMP:
-                self._add(" " + inst_symbol(i) + " ")
+        if not self.gctx.capstone_string: 
+            if i.id in LDR_CHECK:
+                self._operand(i, 0)
+                self._add(" = (")
+                self._type(LDR_TYPE[i.id])
+                self._add(") ")
                 self._operand(i, 1)
+                modified = True
 
-            else:
-                self._add(" = ")
+            elif i.id in STR_CHECK:
                 self._operand(i, 1)
-                if len(i.operands) == 3:
+                self._add(" = (")
+                self._type(STR_TYPE[i.id])
+                self._add(") ")
+                self._operand(i, 0)
+                modified = True
+
+            elif i.id in INST_CHECK:
+                self._operand(i, 0)
+
+                if i.id == ARM_INS_CMP:
                     self._add(" " + inst_symbol(i) + " ")
-                    self._operand(i, 2)
+                    self._operand(i, 1)
 
-            modified = True
+                else:
+                    self._add(" = ")
+                    self._operand(i, 1)
+                    if len(i.operands) == 3:
+                        self._add(" " + inst_symbol(i) + " ")
+                        self._operand(i, 2)
 
-        else:
+                modified = True
+
+        if not modified:
             self._add("%s " % i.mnemonic)
             if len(i.operands) > 0:
                 modified = self._operand(i, 0)
