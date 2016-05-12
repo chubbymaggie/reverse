@@ -1,5 +1,7 @@
 #!/bin/sh
 
+umask 002
+
 REQ_EXEC="python3 pip3"
 for EXEC in ${REQ_EXEC} 
 do
@@ -16,6 +18,13 @@ if [ $PYTHON_VERSION -ne 0 ]; then
     exit
 fi
 
+python3 -c 'import future' >/dev/null 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "error: unable to find the package 'future' for python3 (required for pefile)"
+    exit
+fi
+
+# TODO : locate first capstone
 rm -rf /usr/lib/python3.*/site-packages/capstone*
 rm -rf build
 
@@ -36,12 +45,8 @@ sudo make install3
 cd ../../..
 
 # PE
-# TODO: pip3 install pefile
-# -> fails due to a syntax error
-git clone -b master --depth 1 https://github.com/mlaferrera/python3-pefile
-cd python3-pefile
-sudo -H python3 setup.py install
-cd ..
+# https://github.com/erocarrera/pefile
+sudo -H pip3 install pefile
 
 # ELF
 sudo -H pip3 install pyelftools
