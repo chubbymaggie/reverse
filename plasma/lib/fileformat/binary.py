@@ -32,7 +32,7 @@ T_BIN_UNK = 3
 
 class SectionAbs():
     # virt_size: size of the mapped section in memory
-    def __init__(self, name, start, virt_size, real_size, is_exec, is_data, data):
+    def __init__(self, name, start, virt_size, real_size, is_exec, is_data, is_bss, data):
         self.name = name
         self.start = start
         self.virt_size = virt_size
@@ -41,6 +41,7 @@ class SectionAbs():
         self.real_end = start + real_size - 1
         self.is_exec = is_exec
         self.is_data = is_data
+        self.is_bss = is_bss
         self.data = data
         self.big_endian = False # set in lib.disassembler
 
@@ -54,7 +55,7 @@ class SectionAbs():
         print(" ]")
 
     def read(self, ad, size):
-        if ad >= self.real_end:
+        if ad > self.real_end:
             return b""
         off = ad - self.start
         return self.data[off:off + size]
@@ -71,13 +72,13 @@ class SectionAbs():
         return None
 
     def read_byte(self, ad):
-        if ad >= self.real_end:
+        if ad > self.real_end:
             return None
         off = ad - self.start
         return self.data[off]
 
     def read_word(self, ad):
-        if ad >= self.real_end:
+        if ad > self.real_end:
             return None
         off = ad - self.start
         w = self.data[off:off+2]
@@ -88,7 +89,7 @@ class SectionAbs():
         return (w[1] << 8) + w[0]
 
     def read_dword(self, ad):
-        if ad >= self.real_end:
+        if ad > self.real_end:
             return None
         off = ad - self.start
         w = self.data[off:off+4]
@@ -99,7 +100,7 @@ class SectionAbs():
         return (w[3] << 24) + (w[2] << 16) + (w[1] << 8) + w[0]
 
     def read_qword(self, ad):
-        if ad >= self.real_end:
+        if ad > self.real_end:
             return None
         off = ad - self.start
         w = self.data[off:off+8]
@@ -126,6 +127,7 @@ class SegmentAbs(SectionAbs):
         self.file_offset = file_offset
         self.data = data
         self.big_endian = big_endian
+        self.is_bss = False
 
 
 
@@ -151,6 +153,9 @@ class Binary(object):
         self.wordsize = 0
         self.type = -1
 
+        # It will be set in Console !
+        self.api = None
+
 
     def get_section(self, ad):
         i = bisect.bisect_right(self._sorted_sections, ad)
@@ -164,7 +169,7 @@ class Binary(object):
 
 
     def add_section(self, start_address, name, virt_size, real_size,
-                    is_exec, is_data, data):
+                    is_exec, is_data, is_bss, data):
         if is_exec or is_data:
             bisect.insort_left(self._sorted_sections, start_address)
         self._abs_sections[start_address] = SectionAbs(
@@ -174,6 +179,7 @@ class Binary(object):
                 real_size,
                 is_exec,
                 is_data,
+                is_bss,
                 data)
 
 
@@ -223,7 +229,7 @@ class Binary(object):
 
     def read_byte(self, ad):
         s = self.get_section(ad)
-        if ad >= s.real_end:
+        if ad > s.real_end:
             return None
         return s.read_byte(ad)
 

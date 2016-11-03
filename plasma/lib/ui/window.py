@@ -18,7 +18,7 @@
 #
 
 import curses
-from curses import A_UNDERLINE, color_pair
+from curses import A_UNDERLINE, color_pair, A_REVERSE
 from time import time
 
 from plasma.lib.custom_colors import *
@@ -103,7 +103,7 @@ class Window():
 
         self.search_hi = None
         self.search_bin = None
-        self.word_accepted_chars = ["_", "@", ".", "$", ":"]
+        self.word_accepted_chars = ["_", "@", ".", "$", ":", "?"]
 
         self.time_last_mouse_key = MOUSE_INTERVAL + 1
         self.set_key_timeout = True
@@ -121,11 +121,22 @@ class Window():
             b"\x05": self.k_end, # ctrl-e
             b"\x1b\x5b\x37\x7e": self.k_home,
             b"\x1b\x5b\x38\x7e": self.k_end,
-            b"*": self.cmd_highlight_current_word,
+            b" ": self.cmd_highlight_current_word,
             b"\x0b": self.cmd_highlight_clear, # ctrl-k
             b"\x1b\x5b\x31\x3b\x35\x44": self.k_ctrl_left,
             b"\x1b\x5b\x31\x3b\x35\x43": self.k_ctrl_right,
             b"\n": self.k_enter,
+        }
+
+        self.cursor_position_utf8 = {
+            0: "█",
+            1: "▇",
+            2: "▆",
+            3: "▅",
+            4: "▄",
+            5: "▃",
+            6: "▂",
+            7: "▁",
         }
 
 
@@ -229,41 +240,69 @@ class Window():
         return False
 
 
-    def status_bar(self, s, h, refresh=False):
-        self.screen.move(h, 0)
-        self.screen.clrtoeol()
-        self.screen.addstr(h, 0, s)
-        if refresh:
-            self.screen.refresh()
-
-
     def redraw(self, h, w):
         i = 0
-
         while i < h:
             if self.win_y + i < len(self.token_lines):
-                self.print_line(w, i)
+                self.print_line(w - 1, i)
             else:
                 # force to clear the entire line
                 self.screen.move(i, 0)
             self.screen.clrtoeol()
             i += 1
 
-        if self.has_statusbar:
-            self.screen.move(h, 0)
-            self.screen.clrtoeol()
+        # Print the scroll cursor on the right. It uses utf-8 block characters.
+
+        y = self.get_y_cursor(h * 8, h)
+        i = y % 8
+        y = int(y / 8)
+
+        self.screen.insstr(y, w - 1,
+            self.cursor_position_utf8[i],
+            color_pair(COLOR_SCROLL_CURSOR))
+
+        if i != 0 and y + 1 < h:
+            self.screen.insstr(y + 1, w - 1,
+                self.cursor_position_utf8[i],
+                color_pair(COLOR_SCROLL_CURSOR) | A_REVERSE)
 
         self.screen.refresh()
 
 
+    # Based on the number of lines, this function is rewritten in the visual
+    # mode because the disassembled code is updated after scrolling, so
+    # we don't the total number of lines.
+    def get_y_cursor(self, h8, h):
+        if len(self.token_lines) <= h:
+            return 0
+        y = int(self.win_y * h8 / (len(self.token_lines) - h))
+        if y >= h8 - 8:
+            return h8 - 8
+        return y
+
+
     def start_view(self, screen):
         self.screen = screen
-        screen.clear()
         screen.keypad(False)
         refr = True
 
+        (last_h, last_w) = screen.getmaxyx()
+
         while 1:
             (h, w) = screen.getmaxyx()
+
+            if h != last_h or w != last_w:
+                screen.erase()
+                curses.resizeterm(h, w)
+                last_h = h
+                last_w = w
+                refr = True
+                if self.cursor_y > h:
+                    self.cursor_y = h - 5
+                    if self.cursor_y < 0:
+                        self.cursor_y = 0
+                if self.cursor_x > w:
+                    self.cursor_x = w - 3
 
             if self.has_statusbar:
                 h -= 1
@@ -292,8 +331,10 @@ class Window():
                 break
 
             if self.should_stop:
+                screen.erase()
                 return True
 
+        screen.erase()
         return False
 
 
@@ -350,7 +391,7 @@ class Window():
             y = self.cursor_y + n
             line = self.win_y + self.cursor_y
 
-            wy = self.dump_update_up(wy, h)
+            wy = self.dump_update_up(h, wy)
 
             if wy >= 0:
                 self.win_y = wy
@@ -364,7 +405,7 @@ class Window():
         else:
             # TODO: find another way
             for i in range(n):
-                self.dump_update_up(self.win_y, h)
+                self.dump_update_up(h, self.win_y)
 
                 if self.win_y == 0:
                     if self.cursor_y == 0:
@@ -382,7 +423,7 @@ class Window():
             wy = self.win_y + n
             y = self.cursor_y - n
 
-            self.dump_update_bottom(wy, h)
+            self.dump_update_bottom(h, wy)
 
             if wy > len(self.token_lines) - h:
                 if wy < len(self.token_lines) - 3:
@@ -402,7 +443,7 @@ class Window():
         else:
             # TODO: find another way
             for i in range(n):
-                self.dump_update_bottom(self.win_y, h)
+                self.dump_update_bottom(h, self.win_y)
 
                 if self.win_y >= len(self.token_lines) - h:
                     if self.win_y + self.cursor_y == len(self.token_lines) - 1:
@@ -415,11 +456,11 @@ class Window():
                         self.cursor_y += 1
 
 
-    def dump_update_up(self, wy, h):
+    def dump_update_up(self, h, wy):
         return wy
 
 
-    def dump_update_bottom(self, wy, h):
+    def dump_update_bottom(self, h, wy):
         return
 
 
@@ -487,7 +528,7 @@ class Window():
 
             self.cursor_x = x
             self.goto_line(self.win_y + y, h)
-            self.cmd_highlight_current_word(h, w)
+            self.cmd_highlight_current_word(h, w, True)
             self.check_cursor_x()
 
         elif button == 0x60: # scroll up
@@ -588,7 +629,15 @@ class Window():
         return True
 
 
-    def cmd_highlight_current_word(self, h, w):
+    def cmd_highlight_current_word(self, h, w, from_mouse_event=False):
+        # When we click on a word with the mouse, we must be explicitly
+        # on the word.
+        if not from_mouse_event:
+            num_line = self.win_y + self.cursor_y
+            line = self.output.lines[num_line]
+            if self.cursor_x >= len(line):
+                self.cursor_x = len(line) - 1
+
         w = self.get_word_under_cursor()
         if w is None:
             return False

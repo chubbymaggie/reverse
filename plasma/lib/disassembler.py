@@ -22,7 +22,7 @@ from time import time
 
 from plasma.lib.graph import Graph
 from plasma.lib.utils import (unsigned, debug__, BYTES_PRINTABLE_SET,
-                              get_char, print_no_end)
+                              get_char, print_no_end, warning)
 from plasma.lib.fileformat.binary import Binary, T_BIN_PE, T_BIN_ELF, T_BIN_RAW
 from plasma.lib.colors import (color_addr, color_symbol, color_comment,
                                color_section, color_string)
@@ -71,7 +71,7 @@ class Disassembler():
         self.instanciate_binary(filename, raw_type, raw_base, raw_big_endian)
 
         if self.binary.arch not in ("x86", "x64", "MIPS32", "MIPS64", "ARM"):
-            raise ExcArch(arch)
+            raise ExcArch(self.binary.arch)
 
         self.wordsize = word_size_lookup.get(self.binary.arch, None)
         self.binary.wordsize = self.wordsize
@@ -91,7 +91,10 @@ class Disassembler():
         self.functions = database.functions
         self.func_id = database.func_id
         self.end_functions = database.end_functions
+
         self.xrefs = database.xrefs
+        self.mem.xrefs = database.xrefs
+        self.mem.data_sub_xrefs = database.data_sub_xrefs
 
         self.mips_gp = database.mips_gp
 
@@ -102,6 +105,12 @@ class Disassembler():
             database.demangled = self.binary.demangled
             database.reverse_demangled = self.binary.reverse_demangled
             database.imports = self.binary.imports
+        else:
+            self.binary.symbols = database.symbols
+            self.binary.reverse_symbols = database.reverse_symbols
+            self.binary.demangled = database.demangled
+            self.binary.reverse_demangled = database.reverse_demangled 
+            self.binary.imports = database.imports
 
         cs_arch = arch_lookup.get(self.binary.arch, None)
         cs_mode = mode_lookup.get(self.binary.arch, None)
@@ -117,6 +126,13 @@ class Disassembler():
 
         for s in self.binary.iter_sections():
             s.big_endian = cs_mode & CAPSTONE.CS_MODE_BIG_ENDIAN
+
+        if self.binary.arch == "x86":
+            warning("To compute correctly the value of esp, the frame size must")
+            warning("be correct. But the heuristic is very simple actually.")
+            warning("So every references to ebp should be correct but for esp it")
+            warning("may have some errors.")
+            warning("In the visual press I to show original instructions.")
 
 
     def instanciate_binary(self, filename, raw_type, raw_base, raw_big_endian):
@@ -208,14 +224,24 @@ class Disassembler():
         o = ARCH_OUTPUT.Output(ctx)
         o._new_line()
         o.print_labels = False
+        xrefs = list(ctx.gctx.api.xrefsto(ad))
+        xrefs.sort()
 
-        for x in ctx.gctx.dis.xrefs[ad]:
+        seen = set()
+
+        for x in xrefs:
+            x = self.mem.get_head_addr(x)
+
+            if x in seen:
+                continue
+
+            seen.add(x)
             s = self.binary.get_section(x)
 
             ty = self.mem.get_type(x)
 
             # A PE import should not be displayed as a subroutine
-            if not(self.binary.type == T_BIN_PE and ad in self.binary.imports) \
+            if not(self.binary.type == T_BIN_PE and x in self.binary.imports) \
                    and (ty == MEM_FUNC or ty == MEM_CODE):
 
                 func_id = self.mem.get_func_id(x)
@@ -228,14 +254,15 @@ class Disassembler():
                     else:
                         o._add(" - %d " % (-diff))
 
-                    o._pad_width(20)
+                o._pad_width(20)
 
                 i = self.lazy_disasm(x, s.start)
                 o._asm_inst(i)
 
-            elif ty == MEM_OFFSET:
-                o._address(x)
+            elif MEM_WOFFSET <= ty <= MEM_QOFFSET:
                 o.set_line(x)
+                o._pad_width(20)
+                o._address(x)
                 sz = self.mem.get_size(x)
                 off = s.read_int(x, sz)
                 if off is None:
@@ -245,7 +272,15 @@ class Disassembler():
                 o._imm(off, sz, True, print_data=False, force_dont_print_data=True)
                 o._new_line()
 
+            elif ty == MEM_ARRAY:
+                o.set_line(x)
+                o._pad_width(20)
+                o._address(x)
+                o._label(x, print_colon=True)
+                o._new_line()
+
             else:
+                o._pad_width(20)
                 o._address(x)
                 o.set_line(x)
                 sz = self.mem.get_size_from_type(ty)
@@ -287,7 +322,6 @@ class Disassembler():
 
         o = ARCH_OUTPUT.Output(ctx)
         o._new_line()
-        o.section_prefix = True
         o.curr_section = s
         o.mode_dump = True
         l = 0
@@ -299,7 +333,7 @@ class Disassembler():
 
         while 1:
             if ad == s.start:
-                if not o.is_last_2_line_empty():
+                if not o.last_2_lines_are_empty():
                     o._new_line()
                 o._dash()
                 o._section(s.name)
@@ -319,7 +353,7 @@ class Disassembler():
                     is_func = ad in self.functions
 
                     if is_func:
-                        if not o.is_last_2_line_empty():
+                        if not o.last_2_lines_are_empty():
                             o._new_line()
                         o._dash()
                         o._user_comment("; SUBROUTINE")
@@ -329,7 +363,7 @@ class Disassembler():
                     i = self.lazy_disasm(ad, s.start)
 
                     if not is_func and ad in self.xrefs and \
-                            not o.is_last_2_line_empty():
+                            not o.last_2_lines_are_empty():
                         o._new_line()
 
                     o._asm_inst(i)
@@ -367,7 +401,7 @@ class Disassembler():
 
                     ad += i.size
 
-                elif ty == MEM_OFFSET:
+                elif MEM_WOFFSET <= ty <= MEM_QOFFSET:
                     prefetch_after_branch = False
                     o._label_and_address(ad)
                     o.set_line(ad)
@@ -389,13 +423,83 @@ class Disassembler():
                     o.set_line(ad)
                     sz = self.mem.get_size(ad)
                     buf = self.binary.get_string(ad, sz)
+
                     if buf is not None:
                         if ctx.gctx.print_bytes:
                             o._bytes(s.read(ad, sz))
-                        o._string('"' + buf + '"')
+
+                        # Split the string into multi lines
+
+                        splitted = buf.split("\n")
+
+                        j = 0
+                        for i, st in enumerate(splitted):
+                            if i > 0 and len(st) != 0:
+                                o._new_line()
+                                o.set_line(ad + j)
+                                o._address(ad + j)
+
+                            ibs = 0
+                            bs = 65
+                            while ibs < len(st):
+                                if ibs > 0:
+                                    o._new_line()
+                                    o.set_line(ad + j)
+                                    o._address(ad + j)
+
+                                blk = st[ibs:ibs + bs]
+
+                                if i < len(splitted) - 1 and ibs + bs >= len(st):
+                                    o._string('"' + blk + '\\n"')
+                                    j += len(blk) + 1
+                                else:
+                                    o._string('"' + blk + '"')
+                                    j += len(blk)
+
+                                ibs += bs
+
                     o._add(", 0")
                     o._new_line()
                     ad += sz
+
+                elif ty == MEM_ARRAY:
+                    prefetch_after_branch = False
+                    o._label_and_address(ad)
+
+                    array_info = self.mem.mm[ad]
+                    total_size = array_info[0]
+                    entry_type = array_info[2]
+                    entry_size = self.mem.get_size_from_type(entry_type)
+
+                    n = int(total_size / entry_size)
+
+                    o.set_line(ad)
+                    o._data_prefix(entry_size)
+
+                    k = 0
+                    while k < total_size:
+                        if o.curr_index > 70:
+                            o._new_line()
+                            o.set_line(ad)
+                            o._address(ad)
+                            o._data_prefix(entry_size)
+                            l += 1
+
+                        val = s.read_int(ad, entry_size)
+                        if MEM_WOFFSET <= entry_type <= MEM_QOFFSET:
+                            o._add(" ")
+                            o._imm(val, entry_size, True,
+                                   print_data=False, force_dont_print_data=True)
+                        else:
+                            o._word(val, entry_size, is_from_array=True)
+
+                        ad += entry_size
+                        k += entry_size
+
+                        if k < total_size:
+                            o._add(",")
+
+                    o._new_line()
 
                 else:
                     prefetch_after_branch = False
@@ -428,8 +532,9 @@ class Disassembler():
             o.curr_section = s
 
         if until == ad:
-            if self.mem.is_code(ad) and ad in self.xrefs or ad == s.start:
-                if not o.is_last_2_line_empty():
+            if self.mem.is_code(ad) and ad in self.xrefs or \
+                    s is not None and ad == s.start:
+                if not o.last_2_lines_are_empty():
                     o._new_line()
 
         # remove the last empty line
@@ -439,28 +544,6 @@ class Disassembler():
         o.join_lines()
 
         return o
-
-
-    def find_addr_before(self, ad):
-        l = 0
-        s = self.binary.get_section(ad)
-
-        while l < NB_LINES_TO_DISASM:
-            if self.mem.is_code(ad):
-                size = self.mem.mm[ad][0]
-                l += 1
-                l -= size
-            else:
-                l += 1
-
-            if ad == s.start:
-                s = self.binary.get_prev_section(ad)
-                if s is None:
-                    return ad
-                ad = s.end
-            ad -= 1
-
-        return ad
 
 
     def hexdump(self, ctx, lines):
@@ -534,7 +617,7 @@ class Disassembler():
     # sym_filter : search a symbol, non case-sensitive
     #    if it starts with '-', it prints non-matching symbols
     #
-    def print_symbols(self, print_sections, sym_filter=None):
+    def print_symbols(self, sym_filter=None):
         if sym_filter is not None:
             sym_filter = sym_filter.lower()
             if sym_filter[0] == "-":
@@ -571,9 +654,6 @@ class Disassembler():
                     else:
                         print_no_end(" " + sy)
 
-                    section = self.binary.get_section(ad)
-                    if print_sections and section is not None:
-                        print_no_end(" (" + color_section(section.name) + ")")
                     print()
                     total += 1
 
@@ -720,12 +800,16 @@ class Disassembler():
 
             else:
                 if ad != entry and ARCH_UTILS.is_call(inst):
+                    # TODO: like in the analyzer, simulate registers
+                    # -> during the analysis, save in the database
+                    # the immediate value.
                     op = inst.operands[0]
                     if op.type == self.capstone.CS_OP_IMM:
                         imm = unsigned(op.value.imm)
                         if imm in self.functions and self.is_noreturn(imm):
                             prefetch = self.__add_prefetch(addresses, inst)
                             gph.new_node(inst, prefetch, None)
+                            gph.exit_or_ret.add(ad)
                             continue
 
                 nxt = inst.address + inst.size

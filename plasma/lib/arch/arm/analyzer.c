@@ -30,13 +30,17 @@ typedef char bool;
 // Same as lib.consts
 #define FUNC_OFF_VARS 2
 #define FUNC_INST_ADDR 4
+#define FUNC_FRAME_SIZE 5
 
 
 // It supports only the most common registers (see capstone.arm)
-#define LAST_REG 0
+#define LAST_REG ARM_REG_S31
 #define NB_REGS (LAST_REG + 1)
 
 #define INVALID_VALUE -1
+
+// Set by lib.analyzer
+static int WORDSIZE = 0;
 
 
 struct regs_context {
@@ -51,6 +55,45 @@ static PyTypeObject regs_context_T = {
     "RegsContext",
     sizeof(struct regs_context),
 };
+
+static inline bool is_load(int insn_id)
+{
+    switch (insn_id) {
+    case ARM_INS_LDA:
+    case ARM_INS_LDAB:
+    case ARM_INS_LDAEX:
+    case ARM_INS_LDAEXB:
+    case ARM_INS_LDAEXD:
+    case ARM_INS_LDAEXH:
+    case ARM_INS_LDAH:
+    case ARM_INS_LDC2L:
+    case ARM_INS_LDC2:
+    case ARM_INS_LDCL:
+    case ARM_INS_LDC:
+    case ARM_INS_LDMDA:
+    case ARM_INS_LDMDB:
+    case ARM_INS_LDM:
+    case ARM_INS_LDMIB:
+    case ARM_INS_LDRBT:
+    case ARM_INS_LDRB:
+    case ARM_INS_LDRD:
+    case ARM_INS_LDREX:
+    case ARM_INS_LDREXB:
+    case ARM_INS_LDREXD:
+    case ARM_INS_LDREXH:
+    case ARM_INS_LDRH:
+    case ARM_INS_LDRHT:
+    case ARM_INS_LDRSB:
+    case ARM_INS_LDRSBT:
+    case ARM_INS_LDRSH:
+    case ARM_INS_LDRSHT:
+    case ARM_INS_LDRT:
+    case ARM_INS_LDR:
+        return true;
+    }
+    return false;
+}
+
 
 static inline long py_aslong2(PyObject *obj, const char *name)
 {
@@ -91,6 +134,10 @@ static PyObject *new_regs_context(PyObject *self, PyObject *args)
         r->is_def[i] = false;
     }
 
+    r->regs[ARM_REG_SP] = 0;
+    r->is_def[ARM_REG_SP] = true;
+    r->is_stack[ARM_REG_SP] = true;
+
     return (PyObject*) r;
 }
 
@@ -121,6 +168,12 @@ static void regs_context_dealloc(PyObject *self)
     free(r->is_stack);
 }
 
+static PyObject* set_wordsize(PyObject *self, PyObject *args)
+{
+    PyArg_ParseTuple(args, "i", &WORDSIZE);
+    Py_RETURN_NONE;
+}
+
 static inline int is_reg_supported(int r)
 {
     return r > 0 && r <= LAST_REG;
@@ -131,9 +184,53 @@ static inline int is_reg_defined(struct regs_context *self, int r)
     return is_reg_supported(r) && self->is_def[r];
 }
 
+static inline void reg_mov(struct regs_context *self, int r, long v)
+{
+    self->regs[r] = (long) v;
+    self->is_def[r] = true;
+}
+
+static inline void reg_add(struct regs_context *self, int r, int v1, int v2)
+{
+    *((int*) &self->regs[r]) = v1 + v2;
+}
+
+static inline void reg_sub(struct regs_context *self, int r, int v1, int v2)
+{
+    *((int*) &self->regs[r]) = v1 - v2;
+}
+
+static inline void reg_and(struct regs_context *self, int r, int v1, int v2)
+{
+    *((int*) &self->regs[r]) = v1 & v2;
+}
+
+static PyObject* get_sp(PyObject *self, PyObject *args)
+{
+    struct regs_context *regs;
+    if (!PyArg_ParseTuple(args, "O", &regs))
+        Py_RETURN_NONE;
+    return PyLong_FromLong((int) regs->regs[ARM_REG_SP]);
+}
+
+static PyObject* set_sp(PyObject *self, PyObject *args)
+{
+    struct regs_context *regs;
+    long imm;
+    if (!PyArg_ParseTuple(args, "Ol", &regs, &imm))
+        Py_RETURN_NONE;
+    reg_mov(regs, ARM_REG_SP, (int) imm);
+    Py_RETURN_NONE;
+}
+
 static inline int get_insn_address(PyObject *op)
 {
     return py_aslong2(op, "address");
+}
+
+static long get_reg_value(struct regs_context *regs, int r)
+{
+    return (long) regs->regs[r];
 }
 
 static inline int get_insn_size(PyObject *op)
@@ -176,27 +273,82 @@ static inline long get_op_imm(PyObject *op)
     return py_aslong3(op, "value", "imm");
 }
 
+static inline int get_op_mem_shift_type(PyObject *op)
+{
+    return py_aslong3(op, "shift", "type");
+}
+
+static inline int get_op_mem_scale(PyObject *op)
+{
+    return py_aslong3(op, "mem", "scale");
+}
+
 // out : value, is_stack
 // return true if there is an error (example: a register is invalid or
 // not defined)
 static bool get_op_value(struct regs_context *regs, PyObject *insn, 
                          PyObject *op, long *value, bool *is_stack)
 {
-    int disp;
+    int r, base, index, scale, disp;
+    long imm;
     switch (get_op_type(op)) {
         case ARM_OP_IMM:
             *value = get_op_imm(op);
             *is_stack = false;
             break;
 
+        case ARM_OP_REG:
+            r = get_op_reg(op);
+            if (!is_reg_defined(regs, r))
+                return true;
+            *value = get_reg_value(regs, r);
+            *is_stack = regs->is_stack[r];
+            break;
+
         case ARM_OP_MEM:
-            if (get_op_mem_index(op) == 0 && get_op_mem_base(op) == ARM_REG_PC) {
-                disp = get_op_mem_disp(op);
-                *value = get_insn_address(insn) + get_insn_size(insn) * 2 + disp;
-                *is_stack = false;
-                return false;
+            *is_stack = false;
+            scale = get_op_mem_scale(op);
+            imm = disp = get_op_mem_disp(op);
+
+            base = get_op_mem_base(op);
+            if (base) {
+                if (base == ARM_REG_PC) {
+                    imm += get_insn_address(insn) + get_insn_size(insn) * 2;
+                }
+                else {
+                    if (!is_reg_defined(regs, base)) {
+                        // just analyze the disp value
+                        *value = disp;
+                        return false;
+                    }
+                    imm += get_reg_value(regs, base);
+                    *is_stack = regs->is_stack[base];
+                }
             }
-            return true;
+
+            index = get_op_mem_index(op);
+            if (index) {
+                if (get_op_mem_shift_type(op) != 0) // FIXME
+                    return true;
+
+                if (index == ARM_REG_PC) {
+                    imm += (get_insn_address(insn) + get_insn_size(insn) * 2) * scale;
+                }
+                else {
+                    if (!is_reg_defined(regs, index)) {
+                        // just analyze the disp value
+                        *value = disp;
+                        return false;
+                    }
+                    imm += get_reg_value(regs, index) * scale;
+                    *is_stack |= regs->is_stack[index];
+                    if (*is_stack && scale > 1) // FIXME
+                        return true;
+                }
+            }
+
+            *value = imm;
+            return false;
 
         default:
             return true;
@@ -226,14 +378,33 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
     struct regs_context *regs;
     PyObject *insn;
     PyObject *func_obj;
-    bool one_call_called;
+    PyObject *db, *tmp, *mem, *ty;
 
-    if (!PyArg_ParseTuple(args, "OOOOB",
-            &analyzer, &regs, &insn, &func_obj, &one_call_called))
+    /* if True: stack variables will not be saved and analysis on immediates
+     * will not be run. It will only simulate registers.
+     */
+    bool only_simulate;
+
+    if (!PyArg_ParseTuple(args, "OOOOb",
+            &analyzer, &regs, &insn, &func_obj, &only_simulate))
         Py_RETURN_NONE;
+
+    int id = py_aslong2(insn, "id");
 
     PyObject *list_ops = PyObject_GetAttrString(insn, "operands");
     int len_ops = PyList_Size(list_ops);
+
+    if (id == ARM_INS_PUSH) {
+        reg_sub(regs, ARM_REG_SP, get_reg_value(regs, ARM_REG_SP),
+                WORDSIZE * len_ops);
+        goto end;
+    }
+
+    if (id == ARM_INS_POP) {
+        reg_add(regs, ARM_REG_SP, get_reg_value(regs, ARM_REG_SP),
+                WORDSIZE * len_ops);
+        goto end;
+    }
 
     // FIXME
     if (len_ops <= 1 || len_ops > 3)
@@ -251,18 +422,126 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
     bool is_stack[3] = {false, false, false};
     bool err[3];
 
-    // The first operand is always a register and always the destination
+    // The first operand is always a register and always the destination (except st* ?)
     int r1 = get_op_reg(ops[0]);
     err[0] = !is_reg_supported(r1);
 
+    // Start to the second op !
     for (i = 1 ; i < len_ops ; i++) {
         err[i] = get_op_value(regs, insn, ops[i], &values[i], &is_stack[i]);
 
-        if (err[i])
+        if (err[i] || only_simulate)
             continue;
 
-        PyObject_CallMethod(analyzer, "analyze_imm", "OOi",
-                            insn, ops[i], values[i]);
+        if (get_op_type(ops[i]) == ARM_OP_MEM) {
+            // Pointers are not dereferenced actually.
+            // So it means that we will not simulate this instruction.
+            err[i] = true;
+
+            // Check if there is a stack reference
+            if (is_stack[i] && func_obj != Py_None &&
+                PyLong_AsLong(PyList_GET_ITEM(func_obj, FUNC_FRAME_SIZE)) != -1) {
+
+                // ty = analyzer.db.mem.get_type_from_size(op_size)
+                db = PyObject_GetAttrString(analyzer, "db");
+                mem = PyObject_GetAttrString(db, "mem");
+                ty = PyObject_CallMethod(mem, "get_type_from_size", "i",
+                                         get_op_mem_size(id));
+
+                // The second item is the name of the variable
+                // func_obj[FUNC_OFF_VARS][v] = [ty, None]
+                tmp = PyList_GET_ITEM(func_obj, FUNC_OFF_VARS);
+                Py_INCREF(tmp);
+                PyObject *l = PyList_New(2);
+                PyList_SET_ITEM(l, 0, ty);
+                PyList_SET_ITEM(l, 1, Py_None);
+                PyDict_SetItem(tmp, PyLong_FromLong((int) values[i]), l);
+                Py_DECREF(tmp);
+
+                // func_obj[FUNC_INST_ADDR][i.address] = v
+                tmp = PyList_GET_ITEM(func_obj, FUNC_INST_ADDR);
+                Py_INCREF(tmp);
+                PyDict_SetItem(tmp, PyObject_GetAttrString(insn, "address"),
+                               PyLong_FromLong((int) values[i]));
+                Py_DECREF(tmp);
+
+                Py_DECREF(mem);
+                Py_DECREF(db);
+                continue;
+            }
+        }
+
+        PyObject_CallMethod(analyzer, "analyze_imm", "OOiB",
+                            insn, ops[i], values[i], false);
+    }
+
+    // err[0] = !is_reg_supported(r1)
+
+    if (err[0])
+        goto end;
+
+    if (len_ops == 2) {
+        if (id == ARM_INS_MOV || id == ARM_INS_MVN) {
+            if (!err[1]) {
+                if (id == ARM_INS_MVN)
+                    values[1] = ~values[1];
+                reg_mov(regs, r1, values[1]);
+                regs->is_stack[r1] = is_stack[1];
+                goto save_imm;
+            }
+        }
+
+        // Undefine the register if it's a load
+        if (is_load(id)) {
+            regs->is_def[r1] = false;
+        }
+
+        // Do nothing for all others 2 operands instructions
+        goto end;
+    }
+
+    if (err[1] || err[2]) {
+        // Unset the first register which is the destination in ARM
+        regs->is_def[r1] = false;
+        goto end;
+    }
+
+    regs->is_stack[r1] = is_stack[1] | is_stack[2];
+
+    switch (id) {
+        case ARM_INS_ADD:
+            reg_add(regs, r1, values[1], values[2]);
+            break;
+
+        case ARM_INS_SUB:
+            reg_sub(regs, r1, values[1], values[2]);
+            break;
+
+        case ARM_INS_AND:
+            reg_and(regs, r1, values[1], values[2]);
+            break;
+
+        default:
+            // Can't simulate this instruction, so unset the value of the register
+            regs->is_def[r1] = false;
+            goto end;
+    }
+
+save_imm:
+    if (!regs->is_stack[r1]) {
+        long v = get_reg_value(regs, r1);
+
+        PyObject *ret = PyObject_CallMethod(
+                analyzer, "analyze_imm", "OOiB", insn, ops[0], v, true);
+
+        if (ret == Py_True) {
+            db = PyObject_GetAttrString(analyzer, "db");
+            tmp = PyObject_GetAttrString(db, "immediates");
+            PyDict_SetItem(tmp, PyObject_GetAttrString(insn, "address"),
+                           PyLong_FromLong(v));
+            Py_DECREF(tmp);
+            Py_DECREF(db);
+        }
     }
 
 end:
@@ -276,6 +555,9 @@ static PyMethodDef mod_methods[] = {
     { "clone_regs_context", clone_regs_context, METH_VARARGS },
     { "analyze_operands", analyze_operands, METH_VARARGS },
     { "reg_value", reg_value, METH_VARARGS },
+    { "get_sp", get_sp, METH_VARARGS },
+    { "set_sp", set_sp, METH_VARARGS },
+    { "set_wordsize", set_wordsize, METH_VARARGS },
     { NULL, NULL, 0, NULL }
 };
 

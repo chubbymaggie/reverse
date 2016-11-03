@@ -49,15 +49,76 @@ class Api():
         return self.__binary.get_entry_point()
 
 
-    def __undefine(self, ad, end_range):
-        # TODO : check if instructions contains an address with xrefs
-        if ad in self.__db.functions:
-            # TODO : undefine all func_id of each instructions
-            func_obj = self.__db.functions[ad]
-            del self.__db.functions[ad]
+    # This function remove all xrefs for arrays and offsets.
+    # It's called only from set_* functions to create data
+    # For security, we must run explicitly the "undefine" function
+    # on code and function to create bytes or something else.
+    def __undefine(self, ad, force=False):
+        # TODO: remove comments
+
+        if not force and self.mem.is_code(ad):
+            return False
+
+        # Remove xrefs if we erased offsets.
+
+        if self.mem.is_array(ad):
+            entry_type = self.mem.get_array_entry_type(ad)
+            if MEM_WOFFSET <= entry_type <= MEM_QOFFSET:
+                entry_size = self.mem.get_size_from_type(entry_type)
+                total_size = self.mem.get_size(ad)
+                i = ad
+                s = self.__binary.get_section(ad)
+                end = min(ad + total_size, s.end + 1)
+                while i < end:
+                    off = s.read_int(i, entry_size)
+                    if off is not None and off in self.__db.xrefs:
+                        self.rm_xref(i, off)
+                    i += entry_size
+
+        elif self.mem.is_offset(ad):
+            entry_size = self.mem.get_size(ad)
+            s = self.__binary.get_section(ad)
+            off = s.read_int(ad, entry_size)
+            if off is not None and off in self.__db.xrefs:
+                self.rm_xref(ad, off)
+
+        return True
+
+
+    def undefine(self, ad):
+        """
+        Undefine data/code/function.
+        returns True if ok
+        """
+        self.__undefine(ad, force=True)
+        entry = ad
+
+        # Clear all instructions
+        fid = self.mem.get_func_id(ad)
+        is_code = self.mem.is_code(ad)
+
+        if fid != -1:
+            entry = self.__db.func_id[fid]
+            func_obj = self.__db.functions[entry]
+            del self.__db.functions[entry]
             if func_obj is not None:
                 del self.__db.end_functions[func_obj[FUNC_END]]
-                del self.__db.func_id[func_obj[FUNC_ID]]
+                del self.__db.func_id[fid]
+
+        self.mem.rm_range(entry, max(self.mem.get_size(entry), 1))
+        if entry in self.__db.xrefs:
+            self.mem.add(entry, 1, MEM_BYTE)
+
+        if is_code:
+            # TODO: manage overlapping by calling mem.rm_range ?
+            gph, _ = self.__dis.get_graph(entry)
+            del gph.nodes[entry]
+            for n in gph.nodes:
+                self.mem.rm_range(n, max(self.mem.get_size(n), 1))
+                if entry in self.__db.xrefs:
+                    self.mem.add(entry, 1, MEM_BYTE)
+
+        return True
 
 
     def set_code(self, ad):
@@ -66,7 +127,7 @@ class Api():
         TODO: check if nothing is erased before.
         returns True if ok
         """
-        if self.mem.is_code(ad):
+        if self.mem.is_overlapping(ad):
             return False
         self.__analyzer.msg.put((ad, False, False, False, self.__queue_wait))
         self.__queue_wait.get()
@@ -79,9 +140,8 @@ class Api():
         TODO: check if nothing is erased before.
         returns True if ok
         """
-        if self.mem.is_func(ad):
-            return False
-        if self.mem.get_func_id(ad) != -1:
+        if self.mem.is_func(ad) or self.mem.get_func_id(ad) != -1 or \
+                self.mem.is_overlapping(ad):
             return False
         self.__analyzer.msg.put((ad, True, True, False, self.__queue_wait))
         self.__queue_wait.get()
@@ -97,12 +157,13 @@ class Api():
         deleted from memory.
         returns True if ok
         """
-        self.__undefine(ad, 1)
+        if not self.__undefine(ad):
+            return False
         if ad in self.__db.xrefs:
             self.mem.add(ad, 1, MEM_BYTE)
         else:
             # not useful to store it in the database
-            self.mem.rm_range(ad, ad + 1)
+            self.mem.rm_range(ad, max(self.mem.get_size(ad), 1))
         return True
 
 
@@ -111,7 +172,8 @@ class Api():
         Define a word at ad (2 bytes).
         returns True if ok
         """
-        self.__undefine(ad, 2)
+        if not self.__undefine(ad):
+            return False
         self.mem.add(ad, 2, MEM_WORD)
         return True
 
@@ -121,7 +183,8 @@ class Api():
         Define a double word at ad (4 bytes).
         returns True if ok
         """
-        self.__undefine(ad, 4)
+        if not self.__undefine(ad):
+            return False
         self.mem.add(ad, 4, MEM_DWORD)
         return True
 
@@ -131,7 +194,8 @@ class Api():
         Define a qword at ad (8 bytes).
         returns True if ok
         """
-        self.__undefine(ad, 8)
+        if not self.__undefine(ad):
+            return False
         self.mem.add(ad, 8, MEM_QWORD)
         return True
 
@@ -144,23 +208,30 @@ class Api():
         sz = self.__binary.is_string(ad, min_bytes=1)
         if not sz:
             return False
-        self.__undefine(ad, sz)
+        if not self.__undefine(ad):
+            return False
         self.mem.add(ad, sz, MEM_ASCII)
         return True
 
 
-    def set_offset(self, ad):
+    def set_offset(self, ad, ty=None, async_analysis=True, dont_analyze=False):
         """
-        Define ad as a pointer. If the value is an address to a
-        code location, an analysis will be done. ad must be set as
-        WORD, DWORD or QWORD.
+        Define ad as an offset. If the value is an address to a
+        code location, an analysis will be done. ty should be in
+        [WORD, DWORD, QWORD], if not set the type at the address
+        ad is retrieved.
+        async_analysis and dont_analyze should be used internally ONLY.
+
         returns True if ok
         """
-        ty = self.mem.get_type(ad)
+        if ty is None:
+            ty = self.mem.get_type(ad)
+            sz = self.mem.get_size(ad)
+        else:
+            sz = self.mem.get_size_from_type(ty)
+
         if ty == -1 or ty < MEM_WORD or ty > MEM_QWORD:
             return False
-
-        sz = self.mem.get_size(ad)
 
         s = self.__binary.get_section(ad)
         off = s.read_int(ad, sz)
@@ -171,19 +242,65 @@ class Api():
         if s is None:
             return False
 
-        self.add_xref(ad, off)
-        if not self.mem.exists(off):
+        head = self.mem.get_head_addr(off)
+        if not self.mem.exists(head):
             self.mem.add(off, 1, MEM_UNK)
 
-        self.__undefine(ad, sz)
-        self.mem.add(ad, sz, MEM_OFFSET)
+        self.add_xref(ad, off)
+
+        if not self.__undefine(ad):
+            return False
+
+        if ty == MEM_WORD:
+            self.mem.add(ad, sz, MEM_WOFFSET)
+        elif ty == MEM_DWORD:
+            self.mem.add(ad, sz, MEM_DOFFSET)
+        elif ty == MEM_QWORD:
+            self.mem.add(ad, sz, MEM_QOFFSET)
+
+        if dont_analyze:
+            return True
 
         if self.__analyzer.first_inst_are_code(off):
-            self.__analyzer.msg.put(
-                (off, self.__analyzer.has_prolog(off), False, True,
-                 self.__queue_wait))
-            self.__queue_wait.get()
+            if async_analysis:
+                self.__analyzer.msg.put(
+                    (off, self.__analyzer.has_prolog(off), False, True,
+                     self.__queue_wait))
+                self.__queue_wait.get()
+            else:
+                self.__analyzer.analyze_flow(
+                    off, self.__analyzer.has_prolog(off), False, True)
 
+        return True
+
+
+    def set_array(self, ad, nb_entries, entry_type, dont_analyze=False):
+        """
+        returns True if ok.
+        dont_analyze should be used internally ONLY.
+        """
+        if entry_type < MEM_BYTE or entry_type > MEM_QOFFSET or nb_entries <= 0:
+            return False
+
+        entry_size = self.mem.get_size_from_type(entry_type)
+        sz = entry_size * nb_entries
+
+        s = self.__binary.get_section(ad)
+        if ad + sz > s.end + 1:
+            return False
+
+        if MEM_QOFFSET <= entry_type <= MEM_QOFFSET:
+            end = ad + sz
+            i = ad
+            while i < end:
+                ty = self.mem.get_type(i)
+                if not (MEM_WOFFSET <= ty <= MEM_QOFFSET):
+                    self.set_offset(i, self.mem.get_type_from_size(entry_size), dont_analyze=dont_analyze)
+                i += entry_size
+        elif not self.__undefine(ad):
+            return False
+
+        self.mem.add(ad, sz, MEM_ARRAY, entry_type)
         return True
 
 
@@ -326,9 +443,19 @@ class Api():
         """
         Returns a list of all xrefs to ad.
         """
-        if ad in self.__dis.xrefs:
-            return list(self.__dis.xrefs[ad])
-        return []
+        lst = []
+        if ad in self.__db.data_sub_xrefs:
+            for x in self.__db.data_sub_xrefs[ad]:
+                lst += self.__db.xrefs[x]
+            for i, x in enumerate(lst):
+                ad = self.__db.mem.get_head_addr(x)
+                if ad != x:
+                    lst[i] = ad
+            return set(lst)
+
+        if ad in self.__db.xrefs:
+            lst = set(self.__db.xrefs[ad])
+        return lst
 
 
     def add_symbol(self, ad, name, force=False):
@@ -374,13 +501,14 @@ class Api():
             del self.__db.symbols[name]
 
 
-    def create_jmptable(self, inst_addr, table_addr, entry_size, nb_entries):
+    def create_jmptable(self, inst_addr, table_addr, nb_entries, entry_size, dont_analyze=False):
         """
         Create a jump table.
         inst_addr: address of the jump
         table_addr: address of the table
-        entry_size: size of each address in the table
         nb_entries: number of entries to read
+        entry_size: size of each address in the table
+        dont_analyze should be used internally ONLY.
 
         returns True if ok
         """
@@ -389,10 +517,20 @@ class Api():
         if not table:
             return False
 
+        if entry_size == 2:
+            entry_type = MEM_WOFFSET
+        elif entry_size == 4:
+            entry_type = MEM_DOFFSET
+        elif entry_size == 8:
+            entry_type = MEM_QOFFSET
+
+        self.set_array(table_addr, nb_entries, entry_type, dont_analyze=True)
+
         name = "jmptable_%x" % table_addr
         self.add_symbol(table_addr, name, force=True)
         self.__db.jmptables[inst_addr] = Jmptable(inst_addr, table_addr, table, name)
-        self.__db.internal_inline_comments[inst_addr] = "switch statement %s" % name
+        self.__db.internal_inline_comments[inst_addr] = \
+            "switch statement %s[%d]" % (name, nb_entries)
 
         all_cases = {}
         for ad in table:
@@ -410,48 +548,60 @@ class Api():
                     name
                 )]
 
+        if dont_analyze:
+            return True
+
         # If it's inside a function, the analysis is done on the entire function
         func_id = self.mem.get_func_id(inst_addr)
         if func_id == -1:
-            self.__analyzer.msg.put((inst_addr, False, True, False, self.__queue_wait))
+            self.__analyzer.msg.put((inst_addr, False, True, True, self.__queue_wait))
         else:
             ad = self.__db.func_id[func_id]
-            self.__analyzer.msg.put((ad, True, True, False, self.__queue_wait))
+            self.__analyzer.msg.put((ad, True, True, True, self.__queue_wait))
 
         self.__queue_wait.get()
 
+        return True
+
 
     def add_xref(self, from_ad, to_ad):
-        if isinstance(to_ad, list):
-            for x in to_ad:
-                if x in self.__db.xrefs:
-                    if from_ad not in self.__db.xrefs[x]:
-                        self.__db.xrefs[x].append(from_ad)
-                else:
-                    self.__db.xrefs[x] = [from_ad]
+        if to_ad in self.__db.xrefs:
+            if from_ad not in self.__db.xrefs[to_ad]:
+                self.__db.xrefs[to_ad].append(from_ad)
         else:
-            if to_ad in self.__db.xrefs:
-                if from_ad not in self.__db.xrefs[to_ad]:
-                    self.__db.xrefs[to_ad].append(from_ad)
-            else:
-                self.__db.xrefs[to_ad] = [from_ad]
+            self.__db.xrefs[to_ad] = [from_ad]
+
+        head = self.mem.get_head_addr(to_ad)
+        if head != to_ad and head in self.__db.data_sub_xrefs:
+            self.__db.data_sub_xrefs[head][to_ad] = True
+            end = head + self.mem.get_size(head)
+            self.mem.mm[to_ad] = [end - to_ad, MEM_HEAD, head]
 
 
-    def rm_xrefs(self, from_ad, to_ad):
-        if isinstance(to_ad, list):
-            for x in to_ad:
-                if from_ad in self.__db.xrefs[x]:
-                    self.__db.xrefs[x].remove(from_ad)
-                if not self.__db.xrefs[x]:
-                    del self.__db.xrefs[x]
-        elif to_ad in self.__db.xrefs:
+    def add_xrefs_table(self, from_ad, to_ad_list):
+        for x in to_ad_list:
+            self.add_xref(from_ad, x)
+
+
+    def rm_xref(self, from_ad, to_ad):
+        if to_ad in self.__db.xrefs:
             if from_ad in self.__db.xrefs[to_ad]:
                 self.__db.xrefs[to_ad].remove(from_ad)
             if not self.__db.xrefs[to_ad]:
                 del self.__db.xrefs[to_ad]
 
+        head = self.mem.get_head_addr(to_ad)
+        if head != to_ad and head in self.__db.data_sub_xrefs:
+            del self.__db.data_sub_xrefs[head][to_ad]
 
-    def rm_xrefs_range(self, start, end):
+
+    def rm_xrefs_table(self, from_ad, to_ad_list):
+        for x in to_ad_list:
+            self.rm_xref(from_ad, x)
+
+
+    def rm_xrefs_range(self, start, size):
+        end = start + size
         while start < end:
             if start in self.xrefs:
                 del self.xrefs[start]
@@ -471,12 +621,10 @@ class Api():
         address. If name starts with a reserved prefix, the hexa string
         is converted in decimal.
         """
-        if self.is_reserved_prefix(name):
-            try:
-                return int(name[name.index("_") + 1:], 16)
-            except:
-                return -1
-        return self.__db.symbols.get(name, -1)
+        ctx = self.__gctx.get_addr_context(name, quiet=True)
+        if ctx is None:
+            return -1
+        return ctx.entry
 
 
     def get_symbol(self, ad):
@@ -493,6 +641,10 @@ class Api():
             return self.__db.reverse_symbols[ad]
 
         ty = self.mem.get_type(ad)
+
+        if ty == MEM_ARRAY:
+            ty = self.mem.mm[ad][2]
+
         if ty == MEM_FUNC:
             return "sub_%x" % ad
         if ty == MEM_CODE:
@@ -511,7 +663,7 @@ class Api():
             return "word_%x" % ad
         if ty == MEM_ASCII:
             return "asc_%x" % ad
-        if ty == MEM_OFFSET:
+        if MEM_WOFFSET <= ty <= MEM_QOFFSET:
             return "off_%x" % ad
 
         return None
@@ -522,3 +674,61 @@ class Api():
         Returns a capstone instruction object.
         """
         return self.__dis.lazy_disasm(ad)
+
+
+    def dump_asm(self, ad, nb_lines=10, until=-1):
+        """
+        Returns an Output object. You can then call the function print.
+        until is an end address, if it's set nb_lines is ignored.
+        """
+        ctx = self.__gctx.get_addr_context(ad)
+        return ctx.dump_asm(lines=nb_lines, until=until)
+
+
+    def decompile(self, ad):
+        """
+        Returns an Output object. You can then call the function print.
+        until is an end address, if it's set nb_lines is ignored.
+        """
+        ctx = self.__gctx.get_addr_context(ad)
+        return ctx.decompile()
+
+
+    def get_func_addr(self, ad):
+        """
+        Returns the function address where ad is. It returns None if
+        ad is not in a function.
+        """
+        func_id = self.mem.get_func_id(ad)
+        if func_id == -1:
+            return None
+        return self.__db.func_id[func_id]
+
+
+    def insert_struct(self, name, s):
+        """
+        Create a structure. It returns the struct id or -1 if an error occurs.
+
+        attrs is a list to define each attribute, example :
+        [
+            ["attr1", MEM_POINTER(MEM_BYTE)],
+            ["attr2", MEM_DWORD],
+            ["attr3", MEM_ARRAY, nb_entries],
+        ]
+        """
+        if name in self.__db.structs_name2id:
+            return -1
+
+        id = self.__db.struct_id_counter
+        self.__db.struct_id_counter += 1
+
+        self.__db.structure[id] = s
+        self.__db.structs_name2id[name] = id
+        return id
+
+
+    def get_struct_id(self, name):
+        """
+        Returns the id or -1 if name is unknown.
+        """
+        return self.__db.structs_name2id.get(name, -1)

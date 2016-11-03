@@ -94,8 +94,6 @@ class Output(OutputAbs):
             self._add(" rrx>> %s)" % i.reg_name(shift.value))
 
 
-    # Return True if the operand is a variable (because the output is
-    # modified, we reprint the original instruction later)
     def _operand(self, i, num_op, hexa=False, show_deref=True,
                  force_dont_print_data=False):
         def inv(n):
@@ -135,22 +133,28 @@ class Output(OutputAbs):
 
                     if show_deref:
                         self._add("*(")
-                    self._imm(ad, 4, True, print_data=False,
-                              force_dont_print_data=force_dont_print_data)
+                    self._imm(ad, 4, True, force_dont_print_data=False)
                     if show_deref:
                         self._add(")")
                     return
 
             printed = False
+
+            ret = self.get_var_offset(i, num_op)
+            if ret is not None:
+                func_addr, off = ret
+                self._variable(self.get_var_name(func_addr, off))
+                return
+
             if show_deref:
                 self._add("*(")
 
             if not inv(mm.base):
-                self._add("%s" % i.reg_name(mm.base))
+                self._add(i.reg_name(mm.base))
                 printed = True
 
             elif not inv(mm.segment):
-                self._add("%s" % i.reg_name(mm.segment))
+                self._add(i.reg_name(mm.segment))
                 printed = True
 
             if not inv(mm.index):
@@ -158,7 +162,7 @@ class Output(OutputAbs):
                     self._add(" + ")
 
                 if mm.scale == 1:
-                    self._add("%s" % i.reg_name(mm.index))
+                    self._add(i.reg_name(mm.index))
                 else:
                     self._add("(%s*%d)" % (i.reg_name(mm.index), mm.scale))
 
@@ -175,8 +179,8 @@ class Output(OutputAbs):
                     if printed:
                         self._add(" + ")
                     # is_data=False : don't print string next to the symbol
-                    self._imm(mm.disp, 0, True, section=section, print_data=False,
-                              force_dont_print_data=force_dont_print_data)
+                    self._imm(mm.disp, 0, True, section=section,
+                              force_dont_print_data=False)
                 else:
                     if printed:
                         if mm.disp < 0:
@@ -211,7 +215,7 @@ class Output(OutputAbs):
             self._add(" ")
             self._operand(fused_inst, 1)
             self._add(") ")
-            self._add(cond_symbol(jump_cond))
+            self._add(cond_symbol(cond))
         else:
             self._add(cond_symbol(cond))
             self._add(" ")
@@ -226,9 +230,18 @@ class Output(OutputAbs):
 
     def _sub_asm_inst(self, i, tab=0):
         modified = False
+        is_imm = i.address in self.gctx.db.immediates
 
         if self.gctx.capstone_string == 0:
-            if i.id in LDR_CHECK:
+            if is_imm:
+                self._section("!")
+                self._operand(i, 0)
+                self._add(" = ")
+                self._imm(self.gctx.db.immediates[i.address],
+                          self._dis.wordsize, False)
+                modified = True
+
+            elif i.id in LDR_CHECK:
                 self._operand(i, 0)
                 self._add(" = (")
                 self._type(LDR_TYPE[i.id])
@@ -261,14 +274,22 @@ class Output(OutputAbs):
                 modified = True
 
         if not modified:
-            self._add("%s " % i.mnemonic)
-            if len(i.operands) > 0:
+            if is_imm:
+                self._section("!")
+                self._add("mov ")
                 self._operand(i, 0)
-                k = 1
-                while k < len(i.operands):
-                    self._add(", ")
-                    self._operand(i, k)
-                    k += 1
+                self._add(", ")
+                self._imm(self.gctx.db.immediates[i.address],
+                          self._dis.wordsize, True)
+            else:
+                self._add("%s " % i.mnemonic)
+                if len(i.operands) > 0:
+                    self._operand(i, 0)
+                    k = 1
+                    while k < len(i.operands):
+                        self._add(", ")
+                        self._operand(i, k)
+                        k += 1
 
         if i.update_flags and i.id != ARM_INS_CMP and i.id != ARM_INS_TST:
             self._add(" ")

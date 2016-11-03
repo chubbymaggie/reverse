@@ -112,7 +112,10 @@ class ELF(Binary):
             if s.header.sh_flags & 0xf == 0:
                 continue
 
-            name = s.name.decode()
+            name = s.name
+            if isinstance(name, bytes):
+                name = name.decode()
+
             start = s.header.sh_addr
 
             if start == 0:
@@ -123,11 +126,12 @@ class ELF(Binary):
 
             self.add_section(
                 start,
-                s.name.decode(),
+                name,
                 s.header.sh_size,
                 len(data),
                 self.__section_is_exec(s),
                 self.__section_is_data(s),
+                name == ".bss",
                 data)
 
         # Load segments
@@ -338,7 +342,9 @@ class ELF(Binary):
         if ad == 0:
             return
 
-        name = rel.symbol.name.decode()
+        name = rel.symbol.name
+        if isinstance(name, bytes):
+            name = name.decode()
 
         if name in self.symbols:
             name = self.rename_sym(name)
@@ -432,7 +438,9 @@ class ELF(Binary):
 
             ad = sy.entry.st_value
             if ad != 0 and sy.name != b"":
-                name = sy.name.decode()
+                name = sy.name
+                if isinstance(name, bytes):
+                    name = name.decode()
 
                 if self.is_address(ad):
                     if name in self.symbols:

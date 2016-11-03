@@ -34,7 +34,7 @@ from capstone.x86 import (X86_INS_ADD, X86_INS_AND, X86_INS_CMP, X86_INS_DEC,
 
 from plasma.lib.output import OutputAbs
 from plasma.lib.arch.x86.utils import (inst_symbol, is_call, is_jump, is_ret,
-    is_uncond_jump, cond_symbol)
+    is_uncond_jump, cond_symbol, is_pushpop)
 
 
 ASSIGNMENT_OPS = {X86_INS_XOR, X86_INS_AND, X86_INS_OR,
@@ -70,8 +70,6 @@ REP_PREFIX = {X86_PREFIX_REPNE, X86_PREFIX_REP}
 
 
 class Output(OutputAbs):
-    # Return True if the operand is a variable (because the output is
-    # modified, we reprint the original instruction later)
     def _operand(self, i, num_op, hexa=False, show_deref=True,
                  force_dont_print_data=False):
         def inv(n):
@@ -111,8 +109,12 @@ class Output(OutputAbs):
 
                     if show_deref:
                         self._add("*(")
+
+                    dont_print_data = ad in self.gctx.db.imports or \
+                                      self.gctx.api.mem.is_code(ad)
+
                     self._imm(ad, 4, True,
-                              force_dont_print_data=force_dont_print_data)
+                              force_dont_print_data=dont_print_data)
                     if show_deref:
                         self._add(")")
                     return
@@ -126,18 +128,18 @@ class Output(OutputAbs):
                 self._add("*(")
 
             if not inv(mm.base):
-                self._add("%s" % i.reg_name(mm.base))
+                self._add(i.reg_name(mm.base))
                 printed = True
 
             elif not inv(mm.segment):
-                self._add("%s" % i.reg_name(mm.segment))
+                self._add(i.reg_name(mm.segment))
                 printed = True
 
             if not inv(mm.index):
                 if printed:
                     self._add(" + ")
                 if mm.scale == 1:
-                    self._add("%s" % i.reg_name(mm.index))
+                    self._add(i.reg_name(mm.index))
                 else:
                     self._add("(%s*%d)" % (i.reg_name(mm.index), mm.scale))
                 printed = True
@@ -149,8 +151,9 @@ class Output(OutputAbs):
                 if is_label or section is not None:
                     if printed:
                         self._add(" + ")
-                    self._imm(mm.disp, 0, True, section=section, print_data=False,
-                              force_dont_print_data=force_dont_print_data)
+
+                    self._imm(mm.disp, 0, True, section=section,
+                              force_dont_print_data=True)
                 else:
                     if printed:
                         if mm.disp < 0:
@@ -206,7 +209,7 @@ class Output(OutputAbs):
             self._tabs(tab)
             self._keyword("while")
             # TODO: for 16 and 32 bits
-            self._add(" (!rcx)) {")
+            self._add(" (!rcx) {")
             self._new_line()
             self._tabs(tab + 1)
             self._address(i.address)
@@ -224,7 +227,7 @@ class Output(OutputAbs):
             if i.prefix[0] == X86_PREFIX_REPNE:
                 self._tabs(tab)
                 self._keyword("if")
-                self._add(" (!Z) ")
+                self._add(" (Z) ")
                 self._keyword("break")
                 self._new_line()
             tab -= 1
@@ -243,8 +246,17 @@ class Output(OutputAbs):
 
     def _sub_asm_inst(self, i, tab=0):
         modified = False
+        is_imm = i.address in self.gctx.db.immediates
 
         if self.gctx.capstone_string == 0:
+            if is_imm:
+                self._section("!")
+                self._operand(i, 0)
+                self._add(" = ")
+                self._imm(self.gctx.db.immediates[i.address],
+                          self._dis.wordsize, False)
+                return
+
             if i.id in INST_CHECK:
                 if (i.id == X86_INS_OR and i.operands[1].type == X86_OP_IMM and
                         i.operands[1].value.imm == -1):
@@ -304,33 +316,33 @@ class Output(OutputAbs):
                     self._add(" " + inst_symbol(i) + " ")
                     self._operand(i, 1)
 
-                modified = True
+                return
 
-            elif i.id == X86_INS_CDQE:
+            if i.id == X86_INS_CDQE:
                 self._add("rax = eax")
-                modified = True
+                return
 
-            elif i.id == X86_INS_IDIV:
+            if i.id == X86_INS_IDIV:
                 self._add('eax = edx:eax / ')
                 self._operand(i, 0)
                 self._add('; edx = edx:eax % ')
                 self._operand(i, 0)
-                modified = True
+                return
 
-            elif i.id == X86_INS_MUL:
+            if i.id == X86_INS_MUL:
                 lut = {1: ("al", "ax"), 2: ("ax", "dx:ax"), 4: ("eax", "edx:eax"),
                         8: ("rax", "rdx:rax")}
                 src, dst = lut[i.operands[0].size]
                 self._add('{0} = {1} * '.format(dst, src))
                 self._operand(i, 0)
-                modified = True
+                return
 
-            elif i.id == X86_INS_NOT:
+            if i.id == X86_INS_NOT:
                 self._operand(i, 0)
                 self._add(' ^= -1')
-                modified = True
+                return
 
-            elif i.id in INST_SCAS:
+            if i.id in INST_SCAS:
                 self._operand(i, 0)
                 self._add(" cmp ")
                 self._operand(i, 1)
@@ -338,10 +350,10 @@ class Output(OutputAbs):
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 1, show_deref=False)
-                self._add(" += D")
-                modified = True
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
+                return
 
-            elif i.id in INST_STOS:
+            if i.id in INST_STOS:
                 self._operand(i, 0)
                 self._add(" = ")
                 self._operand(i, 1)
@@ -349,10 +361,10 @@ class Output(OutputAbs):
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 0, show_deref=False)
-                self._add(" += D")
-                modified = True
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
+                return
 
-            elif i.id in INST_LODS:
+            if i.id in INST_LODS:
                 self._operand(i, 0)
                 self._add(" = ")
                 self._operand(i, 1)
@@ -360,10 +372,10 @@ class Output(OutputAbs):
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 1, show_deref=False)
-                self._add(" += D")
-                modified = True
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
+                return
 
-            elif i.id in INST_CMPS:
+            if i.id in INST_CMPS:
                 self._operand(i, 0)
                 self._add(" cmp ")
                 self._operand(i, 1)
@@ -371,15 +383,15 @@ class Output(OutputAbs):
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 0, show_deref=False)
-                self._add(" += D")
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
                 self._new_line()
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 1, show_deref=False)
-                self._add("' += D")
-                modified = True
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
+                return
 
-            elif i.id in INST_MOVS:
+            if i.id in INST_MOVS:
                 self._operand(i, 0)
                 self._add(" = ")
                 self._operand(i, 1)
@@ -387,22 +399,37 @@ class Output(OutputAbs):
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 0, show_deref=False)
-                self._add(" += D")
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
                 self._new_line()
                 self._tabs(tab)
                 self._address(i.address)
                 self._operand(i, 1, show_deref=False)
-                self._add(" += D")
-                modified = True
+                self._add(" += D ? -{0} : {0}".format(i.operands[0].size))
+                return
 
-        if not modified:
-            if len(i.operands) > 0:
+        if is_imm:
+            self._section("!")
+            self._add("mov ")
+            self._operand(i, 0)
+            self._add(", ")
+            self._imm(self.gctx.db.immediates[i.address],
+                      self._dis.wordsize, True)
+            return
+
+        if len(i.operands) > 0:
+            if is_pushpop(i):
+                self._pushpop(i.mnemonic)
+                self._add(" ")
+            else:
                 self._add("%s " % i.mnemonic)
-                self._operand(i, 0)
-                k = 1
-                while k < len(i.operands):
-                    self._add(", ")
-                    self._operand(i, k)
-                    k += 1
+            self._operand(i, 0)
+            k = 1
+            while k < len(i.operands):
+                self._add(", ")
+                self._operand(i, k)
+                k += 1
+        else:
+            if is_pushpop(i):
+                self._pushpop(i.mnemonic)
             else:
                 self._add(i.mnemonic)

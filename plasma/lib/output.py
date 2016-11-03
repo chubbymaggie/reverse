@@ -36,17 +36,21 @@ class OutputAbs():
         self.idx_tok_inline_comm = {} # line -> (char_index, token_index)
         self.curr_index = 0
 
-        self.section_prefix = False
         self.curr_section = None # must be updated at hand !!
         self.print_labels = True
 
         # Easy accesses
-        self._dis = ctx.gctx.dis
-        self._binary = self._dis.binary
-        self.gctx = ctx.gctx
-        self.ctx = ctx
-        self.OP_IMM = self.gctx.libarch.utils.OP_IMM
-        self.ARCH_UTILS = self.gctx.libarch.utils
+        if ctx is not None:
+            self._dis = ctx.gctx.dis
+            self._binary = self._dis.binary
+            self.gctx = ctx.gctx
+            self.ctx = ctx
+            self.OP_IMM = self.gctx.libarch.utils.OP_IMM
+            self.ARCH_UTILS = self.gctx.libarch.utils
+
+        # Only at the decompilation, it's used to add a newline after
+        # a call exit / ret (or equivalent).
+        self.last_inst_exit_or_ret = False
 
 
     # All functions which start with a '_' add a new token/string on
@@ -62,7 +66,7 @@ class OutputAbs():
         line = len(self.token_lines)-1
         self.idx_tok_inline_comm[line] = self.curr_index
 
-    def is_last_2_line_empty(self):
+    def last_2_lines_are_empty(self):
         if len(self.lines) < 2:
             return True
         return len(self.lines[-1]) == 0 and len(self.lines[-2]) == 0
@@ -96,9 +100,11 @@ class OutputAbs():
         self.curr_index += len(string)
 
     def _address(self, addr, print_colon=True, normal_color=False, notprefix=False):
-        if self.section_prefix and not notprefix:
-            self._comment(self.curr_section.name)
-            self._add(" ")
+        if self.gctx.debugsp:
+            from plasma.lib.analyzer import ALL_SP
+            if addr in ALL_SP:
+                self._variable(str(ALL_SP[addr]) + " ")
+                self._pad_width(5)
 
         s = hex(addr)
         if print_colon:
@@ -161,6 +167,11 @@ class OutputAbs():
         self.lines[-1].append(string)
         self.curr_index += len(string)
 
+    def _pushpop(self, string):
+        self.token_lines[-1].append((string, COLOR_PUSHPOP.val, COLOR_PUSHPOP.bold))
+        self.lines[-1].append(string)
+        self.curr_index += len(string)
+
     def _data_prefix(self, size):
         if size == 1:
             self._retcall(".db")
@@ -172,14 +183,15 @@ class OutputAbs():
             self._data(".dq")
 
 
-    def _word(self, by, size):
-        self._data_prefix(size)
+    def _word(self, by, size, is_from_array=False):
+        if not is_from_array:
+            self._data_prefix(size)
         if by is None:
             self._add(" ?")
         else:
             if size == 1:
                 self._add(" %0.2x" % by)
-                if by in BYTES_PRINTABLE_SET:
+                if not is_from_array and by in BYTES_PRINTABLE_SET:
                     if by == 9:
                         self._string("  '\\t'")
                     elif by == 13:
@@ -193,15 +205,47 @@ class OutputAbs():
 
 
     def _label(self, ad, tab=-1, print_colon=True, nocolor=False):
+        # Check if ad is inside an array, in this case we should print
+        # something link "((byte*) &label[idx]) + offset)".
+        tmp_ad = self._dis.mem.get_head_addr(ad)
+        ty = self._dis.mem.get_type(tmp_ad)
+        if ty == MEM_ASCII:
+            if tmp_ad != ad:
+                array_idx = ad - tmp_ad
+                array_offset = 0
+            else:
+                array_idx = -1
+        elif ty == MEM_ARRAY:
+            entry_type = self._dis.mem.get_array_entry_type(tmp_ad)
+            entry_size =  self._dis.mem.get_size_from_type(entry_type)
+            n = ad - tmp_ad
+            array_idx = int(n / entry_size)
+            array_offset = n % entry_size
+        else:
+            array_idx = -1
+
+        ad = tmp_ad
+
         l = self.gctx.api.get_symbol(ad)
         if l is None:
             return False
 
-        ty = self._dis.mem.get_type(ad)
+        # If it's not the label but only from a xref
+        if not print_colon and array_idx != -1:
+            if array_offset != 0:
+                l = "((byte*) &%s[%d]) + %d" % (l, array_idx, array_offset)
+            else:
+                l = "&%s[%d]" % (l, array_idx)
 
+        ty = self._dis.mem.get_type(ad)
         col = 0
-        if ty == MEM_FUNC:
+
+        if ad in self._dis.binary.imports:
+            col = COLOR_SECTION.val
+
+        elif ty == MEM_FUNC:
             col = COLOR_SYMBOL.val
+
         elif ty == MEM_CODE:
             if not self.ctx.is_dump:
                 # It means that in decompilation mode we don't want to print
@@ -214,7 +258,7 @@ class OutputAbs():
             col = COLOR_CODE_ADDR.val
         elif ty == MEM_UNK:
             col = COLOR_UNK.val
-        elif MEM_BYTE <= ty <= MEM_OFFSET:
+        elif MEM_BYTE <= ty <= MEM_ARRAY:
             col = COLOR_DATA.val
 
         if print_colon:
@@ -226,21 +270,28 @@ class OutputAbs():
         if nocolor:
             col = 0
 
-        if tab == -1:
-            self.token_lines[-1].append((l, col, False))
-            self.lines[-1].append(l)
-            self.curr_index += len(l)
-        else:
+        if tab != -1:
             self._tabs(tab)
 
-            if ty == MEM_FUNC:
-                flags = self._dis.functions[ad][FUNC_FLAGS]
-                if flags & FUNC_FLAG_NORETURN:
-                    self._comment("__noreturn__ ")
+        self.token_lines[-1].append((l, col, False))
+        self.lines[-1].append(l)
+        self.curr_index += len(l)
 
-            self.token_lines[-1].append((l, col, False))
-            self.lines[-1].append(l)
-            self.curr_index += len(l)
+        if tab != -1 and ty == MEM_FUNC:
+            flags = self._dis.functions[ad][FUNC_FLAGS]
+            if flags != 0:
+                self._comment("  ")
+            if flags & FUNC_FLAG_NORETURN:
+                self._comment(" __noreturn__")
+            if flags & FUNC_FLAG_CDECL:
+                self._comment(" __cdecl__")
+
+        # If it's a label
+        if print_colon and ty == MEM_ARRAY:
+            entry_type = self._dis.mem.get_array_entry_type(ad)
+            sz_entry = self._dis.mem.get_size_from_type(entry_type)
+            n = int(self._dis.mem.get_size(ad) / sz_entry)
+            self._internal_comment(" ; [%d]" % n)
 
         return True
 
@@ -257,6 +308,13 @@ class OutputAbs():
 
         if not is_first and self._label(ad, tab, print_colon):
             self._new_line()
+
+            if self._dis.mem.is_func(ad):
+                frame_size = self._dis.functions[ad][FUNC_FRAME_SIZE]
+                if frame_size != 0:
+                    self._new_line()
+                    self._comment("frame_size = %d" % frame_size)
+                    self._new_line()
 
             # Print stack variables
             if self._dis.mem.is_func(ad):
@@ -277,7 +335,7 @@ class OutputAbs():
 
     def _previous_comment(self, i, tab):
         if i.address in self._dis.internal_previous_comments:
-            if self.ctx.is_dump and not self.is_last_2_line_empty():
+            if not self.last_2_lines_are_empty():
                 self._new_line()
             for comm in self._dis.internal_previous_comments[i.address]:
                 self._tabs(tab)
@@ -285,7 +343,7 @@ class OutputAbs():
                 self._new_line()
 
         if i.address in self._dis.user_previous_comments:
-            if self.ctx.is_dump and not self.is_last_2_line_empty():
+            if self.ctx.is_dump and not self.last_2_lines_are_empty():
                 self._new_line()
             for comm in self._dis.user_previous_comments[i.address]:
                 self._tabs(tab)
@@ -362,8 +420,6 @@ class OutputAbs():
             return
 
         lst.sort()
-        self._new_line()
-
         for off in lst:
             self._tabs(tabs)
             self._type(self.__get_var_type(func_addr, off))
@@ -436,6 +492,10 @@ class OutputAbs():
             ty = self._dis.mem.get_type(imm)
             # ty == -1 : from the terminal (with -x) there are no xrefs if
             # the file was loaded without a database.
+            if ty == MEM_HEAD and self._dis.mem.get_type(
+                    self._dis.mem.get_head_addr(imm)) == MEM_ASCII:
+                ty = MEM_ASCII
+
             if imm in self._dis.xrefs and ty != MEM_UNK and \
                     ty != MEM_ASCII or ty == -1:
                 return
@@ -461,6 +521,7 @@ class OutputAbs():
             if not force_dont_print_data and print_data:
                 s = self._binary.get_string(imm, self.gctx.max_data_size)
                 if s is not None:
+                    s = s.replace("\n", "\\n")
                     self._add(" ")
                     self._string('"' + s + '"')
 
@@ -470,7 +531,10 @@ class OutputAbs():
             return
 
         if op_size == 1:
-            self._string("'%s'" % get_char(imm))
+            if imm == 10:
+                self._string("'\\n'")
+            else:
+                self._string("'%s'" % get_char(imm))
         elif hexa:
             self._add(hex(imm))
         else:
@@ -564,6 +628,15 @@ class OutputAbs():
             self._add(" {")
 
         self._new_line()
+
+        if self._dis.mem.is_func(entry):
+            frame_size = self._dis.functions[entry][FUNC_FRAME_SIZE]
+            if frame_size != 0:
+                self._new_line()
+                self._tabs(1)
+                self._comment("frame_size = %d" % frame_size)
+                self._new_line()
+
         self._all_vars(entry)
         ast.dump(self, 1)
         self._add("}")
@@ -580,6 +653,9 @@ class OutputAbs():
 
 
     def _asm_inst(self, i, tab=0, prefix=""):
+        if self.last_inst_exit_or_ret:
+            self._new_line()
+
         self._previous_comment(i, tab)
 
         if prefix == "# ":
@@ -620,16 +696,6 @@ class OutputAbs():
             elif self.ARCH_UTILS.is_call(i):
                 self._retcall(i.mnemonic)
                 self._add(" ")
-
-                if self.gctx.sectionsname:
-                    op = i.operands[0]
-                    if op.type == self.OP_IMM:
-                        s = self._binary.get_section(op.value.imm)
-                        if s is not None:
-                            self._add("(")
-                            self._section(s.name)
-                            self._add(") ")
-
                 self._operand(i, 0, hexa=True, force_dont_print_data=True)
 
             # Here we can have conditional jump with the option --dump
@@ -639,12 +705,12 @@ class OutputAbs():
                     self._add(" ")
 
                     for num in range(len(i.operands)-1):
-                        self._operand(i, num)
+                        self._operand(i, num, hexa=True, force_dont_print_data=True)
                         self._add(", ")
 
                     # WARNING: it assumes that the last operand is the address
                     if i.operands[-1].type != self.OP_IMM:
-                        self._operand(i, -1, force_dont_print_data=True)
+                        self._operand(i, -1, hexa=True, force_dont_print_data=True)
                         if self.ARCH_UTILS.is_uncond_jump(i) and \
                                 not self.ctx.is_dump and \
                                 i.address not in self._dis.jmptables:
@@ -660,6 +726,9 @@ class OutputAbs():
 
         self._inline_comment(i)
         self._new_line()
+
+        self.last_inst_exit_or_ret = \
+            not self.ctx.is_dump and i.address in self.ctx.gph.exit_or_ret
 
 
     def print(self):

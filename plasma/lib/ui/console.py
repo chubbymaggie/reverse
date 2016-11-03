@@ -24,19 +24,36 @@ import code
 import traceback
 import readline, rlcompleter
 
+from plasma.lib.consts import *
 from plasma.lib.colors import color, bold
 from plasma.lib.utils import error, print_no_end
 from plasma.lib.fileformat.binary import T_BIN_ELF, T_BIN_PE, T_BIN_RAW
-from plasma.lib.consts import NB_LINES_TO_DISASM
 from plasma.lib.ui.visual import Visual
 from plasma.lib.api import Api
 from plasma.lib.analyzer import Analyzer
 
+import plasma
+PLASMA_SCRIPTS_DIR = os.path.dirname(plasma.__file__) + "/scripts"
 
 MAX_PRINT_COMPLETE = 300
-
 SHOULD_EXIT = False
 
+# Used for scripting
+EXPORTED_SYMBOLS = {
+    "MEM_UNK": MEM_UNK,
+    "MEM_CODE": MEM_CODE,
+    "MEM_FUNC": MEM_FUNC,
+    "MEM_BYTE": MEM_BYTE,
+    "MEM_WORD": MEM_WORD,
+    "MEM_DWORD": MEM_DWORD,
+    "MEM_QWORD": MEM_QWORD,
+    "MEM_WOFFSET": MEM_WOFFSET,
+    "MEM_DOFFSET": MEM_DOFFSET,
+    "MEM_QOFFSET": MEM_QOFFSET,
+    "MEM_ASCII": MEM_ASCII,
+    "MEM_ARRAY": MEM_ARRAY,
+    "MEM_HEAD": MEM_HEAD,
+}
 
 COMMANDS_ALPHA = [
     "analyzer",
@@ -48,6 +65,7 @@ COMMANDS_ALPHA = [
     "history",
     "info",
     "jmptable",
+    "memmap",
     "mips_set_gp",
     "py",
     "push_analyze_symbols",
@@ -57,7 +75,6 @@ COMMANDS_ALPHA = [
     "sym",
     "x",
     "v",
-    "display.print_section",
     "xrefs",
 ]
 
@@ -136,11 +153,16 @@ class Completer():
 
 
     def loop(self):
+        if sys.stdin.isatty():
+            prompt = bold(color("plasma> ", 11))
+        else:
+            prompt = ""
+
         while 1:
             if SHOULD_EXIT:
                 break
             try:
-                line = input(bold(color("plasma> ", 11)))
+                line = input(prompt)
                 if line:
                     self.con.exec_command(line)
 
@@ -149,7 +171,8 @@ class Completer():
                 pass
 
             except EOFError:
-                print()
+                if sys.stdin.isatty():
+                    print()
                 break
 
 
@@ -162,6 +185,17 @@ class Console():
         self.db = gctx.db
         gctx.vim = False
 
+        # After exiting the visual mode we copy last addresses we have visited.
+        # Then we can just enter 'v' and we go where we were.
+        self.last_entry = None
+        self.last_stack = []
+        self.last_saved_stack = []
+
+        # A hack to allow window resizing
+        os.environ['LINES']="blah"
+        del os.environ['LINES']
+        os.environ['COLUMNS']="blah"
+        del os.environ['COLUMNS']
 
         self.COMMANDS = {
             "analyzer": Command(
@@ -170,7 +204,7 @@ class Console():
                 None,
                 [
                 "",
-                "Analyzer information",
+                "Analyzer status.",
                 ]
             ),
 
@@ -190,7 +224,7 @@ class Console():
                 None,
                 [
                 "",
-                "Display this help"
+                "Display this help."
                 ]
             ),
 
@@ -200,7 +234,7 @@ class Console():
                 None,
                 [
                 "",
-                "Display the command history",
+                "Display the command history.",
                 ]
             ),
 
@@ -210,7 +244,7 @@ class Console():
                 None,
                 [
                 "",
-                "Save the database (only symbols and history currently).",
+                "Save the database.",
                 ]
             ),
 
@@ -232,33 +266,42 @@ class Console():
                 self.__complete_x,
                 [
                 "[SYMBOL|0xXXXX|EP]",
-                "Visual mode",
-                "Shortcuts:",
+                "Visual mode: if no address or symbol is given, you go at the",
+                "previous address before exiting the visual mode.",
+                "",
+                "Main shortcuts:",
                 "c       create code",
                 "b/w/d/Q create byte/word/dword/qword",
                 "a       create ascii string",
                 "p       create function",
                 "o       set [d|q]word as an offset",
+                "*       create an array",
                 "x       show xrefs",
                 "r       rename",
-                "/       binary search: if the first char is ! you can put an",
-                "        hexa string example: /!ab 13 42",
-                "n/N     next/previous search occurence",
-                "I       switch to traditional instruction string output",
+                "space   highlight current word (ctrl-k to clear)",
+                ";       edit inline comment (enter/escape to validate/cancel)",
+                "U       undefine",
+                "",
+                "Options:",
+                "I       switch to traditional instruction string output (3 modes)",
                 "M       show/hide mangling",
                 "B       show/hide bytes",
+                "",
+                "Navigation:",
+                "/       binary search: if the first char is ! you can put an",
+                "        hexa string example: /!ab 13 42",
+                "        the search is case sensitive.",
+                "n/N     next/previous search occurence",
                 "g       top",
                 "G       bottom",
                 "z       set current line on the middle",
-                "Q       quit",
-                ";       edit inline comment (enter/escape to validate/cancel)",
                 "%       goto next bracket",
-                "*       highlight current word (ctrl-k to clear)",
                 "{ }     previous/next paragraph",
                 "tab     switch between dump/decompilation",
                 "enter   follow address",
                 "escape  go back",
-                "u       re-enter (for undo)",
+                "u       re-enter",
+                "q       quit",
                 ]
             ),
 
@@ -279,17 +322,7 @@ class Console():
                 self.__complete_x,
                 [
                 "SYMBOL|0xXXXX|EP [NB_LINES]",
-                "Disassemble only.",
-                ]
-            ),
-
-            "set": Command(
-                3,
-                None,
-                None,
-                [
-                "",
-                "Set options"
+                "Print contents at the specified address.",
                 ]
             ),
 
@@ -331,7 +364,7 @@ class Console():
                 None,
                 [
                 "",
-                "Print all sections",
+                "Print all sections.",
                 ]
             ),
 
@@ -341,17 +374,7 @@ class Console():
                 None,
                 [
                 "",
-                "Information about the current binary"
-                ]
-            ),
-
-            "display.print_section": Command(
-                0,
-                self.__exec_display_print_section,
-                None,
-                [
-                "",
-                "Print or not section when an address is found"
+                "Information about the current binary."
                 ]
             ),
 
@@ -367,13 +390,14 @@ class Console():
             ),
 
             "py": Command(
-                1,
+                -1,
                 self.__exec_py,
                 self.__complete_file,
                 [
-                "[FILE]",
+                "[!][FILE]",
                 "Run an interactive python shell or execute a script.",
-                "The global variable 'api' will be accessible."
+                "Global variables api and args will be passed to the script.",
+                "The character ! is an alias to the scripts directory."
                 ]
             ),
 
@@ -383,7 +407,8 @@ class Console():
                 None,
                 [
                 "ADDR",
-                "Set the register $gp to a fixed value."
+                "Set the register $gp to a fixed value. Note that it will",
+                "erase all defined memory."
                 ]
             ),
 
@@ -403,7 +428,17 @@ class Console():
                 self.__complete_x,
                 [
                 "SYMBOL|0xXXXX|EP",
-                "Print all xrefs."
+                "Print cross references to the specified address."
+                ]
+            ),
+
+            "memmap": Command(
+                0,
+                self.__exec_memmap,
+                None,
+                [
+                "",
+                "Open a qt window to display the memory."
                 ]
             ),
         }
@@ -422,7 +457,9 @@ class Console():
         gctx.api = self.api
         self.analyzer.set(gctx, arch_analyzer)
 
-        if gctx.dis.is_mips and gctx.dis.mips_gp == -1:
+        self.gctx.dis.binary.api = self.api
+
+        if gctx.dis.is_mips and not gctx.dis.mips_gp:
             print("please run first these commands :")
             print("mips_set_gp 0xADDRESS")
             print("push_analyze_symbols")
@@ -430,6 +467,10 @@ class Console():
             # If false it means that the first analysis was already done
             if gctx.autoanalyzer and len(self.db.mem) == 0:
                 self.push_analyze_symbols(None)
+
+        print("new feature: an instruction preceded by ! means that the analyzer", file=sys.stderr)
+        print("has computed an immediate value. In the visual mode, use the shortcut", file=sys.stderr)
+        print("I to show original instructions.", file=sys.stderr)
 
         self.comp = Completer(self)
         self.comp.set_history(self.db.history)
@@ -456,21 +497,38 @@ class Console():
             return []
 
         results = []
-        basename = os.path.basename(last_tok)
-        dirname = os.path.dirname(last_tok)
 
-        if not dirname:
-            dirname = "."
+        if last_tok.startswith("!"):
+            basename = last_tok[1:]
+            dirname = PLASMA_SCRIPTS_DIR
+        else:
+            basename = os.path.basename(last_tok)
+            dirname = os.path.dirname(last_tok)
+            if not dirname:
+                dirname = "."
 
         try:
             i = 0
             for f in os.listdir(dirname):
                 if f.startswith(basename):
                     f_backslahed = f.replace(" ", "\\ ")
-                    if os.path.isdir(os.path.join(dirname, f)):
-                        s = "%s/%s/" % (dirname, f_backslahed)
+
+                    if last_tok.startswith("!"):
+                        s = "!%s " % f_backslahed
                     else:
-                        s = "%s/%s " % (dirname, f_backslahed)
+                        if os.path.isdir(os.path.join(dirname, f)):
+                            if dirname == "/":
+                                s = "/%s/" % f_backslahed
+                            elif dirname == ".":
+                                s = "%s/" % f_backslahed
+                            else:
+                                s = "%s/%s/" % (dirname, f_backslahed)
+                        else:
+                            if dirname == ".":
+                                s = "%s " % f_backslahed
+                            else:
+                                s = "%s/%s " % (dirname, f_backslahed)
+
                     results.append(s)
                     i += 1
                     if i == MAX_PRINT_COMPLETE:
@@ -512,12 +570,14 @@ class Console():
 
     def exec_command(self, line):
         args = shlex.split(line)
+        if not args:
+            return
         if args[0] not in self.COMMANDS:
             error("unknown command")
             return
         c = self.COMMANDS[args[0]]
 
-        if len(args)-1 > c.max_args:
+        if c.max_args != -1 and len(args) - 1 > c.max_args:
             error("%s takes max %d args" % (args[0], c.max_args))
             return
 
@@ -574,7 +634,9 @@ class Console():
         # Analyze entry point
         ep = self.gctx.dis.binary.get_entry_point()
         if ep is not None:
-            self.analyzer.msg.put((ep, False, True, False, None))
+            self.analyzer.msg.put((ep, True, True, False, None))
+
+        self.analyzer.msg.put("rename_entry_point")
 
         # Analyze static functions
         for ad in self.db.reverse_symbols:
@@ -598,14 +660,14 @@ class Console():
 
     def __exec_sym(self, args):
         if len(args) == 1:
-            self.gctx.dis.print_symbols(self.gctx.sectionsname)
+            self.gctx.dis.print_symbols()
             return
 
         if args[1][0] == "|":
             if len(args) == 2 or len(args) > 3:
                 error("bad arguments (warn: need spaces between |)")
                 return
-            self.gctx.dis.print_symbols(self.gctx.sectionsname, args[2])
+            self.gctx.dis.print_symbols(args[2])
             return
 
         if len(args) > 3:
@@ -647,12 +709,18 @@ class Console():
 
 
     def __exec_v(self, args):
-        ad = None if len(args) == 1 else args[1]
+        if len(args) != 1:
+            ad = args[1]
+        else:
+            ad = self.last_entry
         ctx = self.gctx.get_addr_context(ad)
         if ctx:
             o = ctx.dump_asm(NB_LINES_TO_DISASM)
             if o is not None:
-                Visual(self.gctx, ctx, self.analyzer, self.api)
+                v = Visual(self.gctx, ctx, self.analyzer, self.api,
+                       self.last_stack, self.last_saved_stack)
+                if v.last_curr_line_ad is not None:
+                    self.last_entry = v.last_curr_line_ad
 
 
     def __exec_help(self, args):
@@ -704,15 +772,6 @@ class Console():
             print("Endianess: little endian")
 
 
-    def __exec_display_print_section(self, args):
-        if self.gctx.sectionsname:
-            print("now it's off")
-            self.gctx.sectionsname = False
-        else:
-            print("now it's on")
-            self.gctx.sectionsname = True
-
-
     def __exec_save(self, args):
         self.db.save(self.comp.get_history())
         print("database saved to", self.db.path)
@@ -734,12 +793,15 @@ class Console():
             return
 
         self.db.modified = True
-        self.api.create_jmptable(inst_addr, table_addr, entry_size, nb_entries)
+        self.api.create_jmptable(inst_addr, table_addr, nb_entries, entry_size)
 
 
     def __exec_py(self, args):
-        ns = {"api": self.api}
-        if len(args) == 2:
+        ns = {"api": self.api, "args": args[1:], "analyzer": self.analyzer}
+        ns.update(EXPORTED_SYMBOLS)
+        if len(args) > 1:
+            if args[1].startswith("!"):
+                args[1] = "%s/%s" % (PLASMA_SCRIPTS_DIR, args[1][1:])
             exec(open(args[1]).read(), ns)
         else:
             readline.set_completer(rlcompleter.Completer(ns).complete)
@@ -751,9 +813,12 @@ class Console():
         try:
             self.gctx.dis.mips_gp = int(args[1], 16)
             self.db.mips_gp = self.gctx.dis.mips_gp
+            self.db.mem.mm.clear()
+            self.db.xrefs.clear()
+            self.db.data_sub_xrefs.clear()
+            self.db.immediates.clear()
         except:
             error("bad address")
-
         self.db.modified = True
 
 
@@ -764,9 +829,7 @@ class Console():
     def __exec_xrefs(self, args):
         ad = None if len(args) == 1 else args[1]
         ctx = self.gctx.get_addr_context(ad)
-        if ctx:
-            if ctx.entry not in self.gctx.dis.xrefs:
-                return
+        if ctx and ctx.entry in self.gctx.db.xrefs or self.gctx.db.data_sub_xrefs:
             ctx.dump_xrefs().print()
 
 
@@ -775,6 +838,14 @@ class Console():
         print("addresses remaining to analyze:", n)
 
         if self.analyzer.running_second_pass:
-            print("scanning the whole memory...")
+            print("memory scan...")
             ad = self.analyzer.where
-            print("  -> %s: 0x%x" % (self.gctx.dis.binary.get_section(ad).name, ad))
+            s = self.gctx.dis.binary.get_section(ad)
+            percent = int((ad - s.start) * 100 / s.real_size)
+            print("  -> %s %d%%  (0x%x)" % (s.name, percent, ad))
+
+
+    def __exec_memmap(self, args):
+        from plasma.lib.memmap import ThreadMemoryMap
+        t = ThreadMemoryMap(self.db, self.gctx.dis.binary)
+        t.start()

@@ -47,7 +47,6 @@ class GlobalContext():
         self.is_interactive = False
 
         # Command line options
-        self.sectionsname = False
         self.print_andif = True
         self.color = True
         self.max_data_size = 30
@@ -70,6 +69,7 @@ class GlobalContext():
         self.capstone_string = 0 # See lib.ui.visual.main_cmd_inst_output
         self.show_mangling = True
         self.autoanalyzer = True
+        self.debugsp = False
 
         # Built objects
         self.dis = None # Disassembler
@@ -108,7 +108,6 @@ class GlobalContext():
         parser.add_argument('-i', '--interactive', action='store_true',
                 help='Interactive mode')
         parser.add_argument('-d', '--opt_debug', action='store_true')
-        parser.add_argument('-ns', '--nosectionsname', action='store_true')
         parser.add_argument('--raw', metavar='x86|x64|arm|mips|mips64',
                 help='Consider the input file as a raw binary')
         parser.add_argument('--rawbase', metavar='0xXXXXX',
@@ -117,13 +116,14 @@ class GlobalContext():
                 help='If not set it\'s in little endian')
         parser.add_argument('-na', '--noautoanalyzer', action='store_true',
                 help='Disable analysis on the entry point / symbols and don\'t scan memmory. You can force it with the command push_analyze_symbols.')
+        parser.add_argument('--debugsp', action='store_true',
+                help="Print the stack offset on each instructions. Warning: these values will not be saved in the database.")
 
         args = parser.parse_args()
 
         self.debug           = args.opt_debug
         self.print_andif     = not args.noandif
         self.color           = not args.nocolor
-        self.sectionsname    = not args.nosectionsname
         self.max_data_size   = args.datasize
         self.filename        = args.filename
         self.raw_type        = args.raw
@@ -138,6 +138,7 @@ class GlobalContext():
         self.raw_big_endian  = args.rawbe
         self.list_sections   = args.sections
         self.autoanalyzer    = not args.noautoanalyzer
+        self.debugsp         = args.debugsp
 
         if args.nbytes == 0:
             self.nbytes = 4
@@ -217,12 +218,12 @@ class GlobalContext():
         return True
 
 
-    def get_addr_context(self, ad):
+    def get_addr_context(self, ad, quiet=False):
         adctx = AddrContext(self)
         if isinstance(ad, int):
             adctx.entry = self.db.mem.get_head_addr(ad)
             return adctx
-        ret = adctx.init_address(ad) # here ad is a string
+        ret = adctx.init_address(ad, quiet=quiet) # here ad is a string
         if not ret:
             return None
         adctx.entry = self.db.mem.get_head_addr(adctx.entry)
@@ -251,7 +252,7 @@ class AddrContext():
         self.ast = None
 
 
-    def init_address(self, entry):
+    def init_address(self, entry, quiet=False):
         if isinstance(entry, int):
             self.entry = entry
             return True
@@ -269,7 +270,7 @@ class AddrContext():
                          self.gctx.db.symbols.get("_main", None)
 
             if self.entry is None:
-                error("symbol main or _main not found")
+                error("symbol main or _main not found, try with EP")
                 if self.gctx.interactive_mode:
                     return False
                 die()
@@ -285,7 +286,8 @@ class AddrContext():
             try:
                 self.entry = int(entry, 16)
             except:
-                error("bad hexa string %s" % entry)
+                if not quiet:
+                    error("bad hexa string %s" % entry)
                 if self.gctx.interactive_mode:
                     return False
                 die()
@@ -296,7 +298,8 @@ class AddrContext():
                      self.gctx.dis.binary.section_names.get(entry, None)
 
         if self.entry is None:
-            error("symbol %s not found" % entry)
+            if not quiet:
+                error("symbol %s not found" % entry)
             if self.gctx.interactive_mode:
                 return False
                 die()
@@ -339,7 +342,7 @@ class AddrContext():
 
     def dump_asm(self, lines=NB_LINES_TO_DISASM, until=-1):
         self.is_dump = True
-        o = self.gctx.dis.dump_asm(self, lines, until=until)
+        o = self.gctx.dis.dump_asm(self, lines=lines, until=until)
         self.output = o
         return o
 

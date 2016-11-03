@@ -19,21 +19,28 @@
 
 
 # Type of data in Memory
+
 MEM_UNK = 1
 MEM_CODE = 2
 MEM_FUNC = 3
+
 MEM_BYTE = 4
 MEM_WORD = 5
 MEM_DWORD = 6
 MEM_QWORD = 7
-MEM_ASCII = 8
-MEM_OFFSET = 9
+MEM_WOFFSET = 8
+MEM_DOFFSET = 9
+MEM_QOFFSET = 10
+MEM_ASCII = 11
+MEM_ARRAY = 12
+MEM_STRUCT = 13
 
 # For big strings or data we put a MEM_HEAD every BLOCK_SIZE bytes and at
 # the end of the data. It allows to scroll up correctly in the visual mode.
-MEM_HEAD = 10
-BLOCK_SIZE = 128 # should be a power of 2
-BLOCK_SIZE_MASK = 128-1
+# BLOCK_SIZE should not be too big otherwise performance will decrease.
+MEM_HEAD = 50
+BLOCK_SIZE = 64 # should be a power of 2
+BLOCK_SIZE_MASK = 64-1
 
 
 # Index of values for each Database.functions[i]
@@ -42,6 +49,7 @@ FUNC_FLAGS = 1
 FUNC_OFF_VARS = 2
 FUNC_ID = 3
 FUNC_INST_ADDR = 4
+FUNC_FRAME_SIZE = 5
 
 # Index of values for each Database.functions[i][FUNC_OFF_VARS][offset]
 VAR_TYPE = 0
@@ -49,23 +57,28 @@ VAR_NAME = 1
 
 
 # List of flags, in Database.functions[i][FUNC_FLAGS]
-FUNC_FLAG_NORETURN = 1
+FUNC_FLAG_NORETURN = 0x1
+FUNC_FLAG_CDECL = 0x2
 
 
 # Known functions which never returns
 NORETURN_ELF = {
     "exit", "_exit", "__stack_chk_fail", "err", "verr", "errx", "verrx",
-    "abort", "__assert_fail", "__libc_start_main", "perror",
+    "abort", "__assert_fail", "__libc_start_main", "perror", "__cxa_rethrow",
+    "__cxa_throw", "__cxa_call_terminate", "__cxa_bad_cast", "__cxa_call_unexpected",
+    "__cxa_call_unexpected", "__terminate", "__unexpected",
 }
 
 NORETURN_PE = {
-    "exit", "ExitProcess", "_exit", "quick_exit", "_Exit", "abort"
+    "exit", "ExitProcess", "_exit", "quick_exit", "_Exit", "abort",
+    "_CxxThrowException", "quick_exit", "RaiseException",
 }
 
 
-# This is the number of lines to disassemble (without comments and newline:
-# it counts only lines which start with an address)
-NB_LINES_TO_DISASM = 256
+# This is the number of lines to disassemble (without comments and newlines:
+# it counts only lines which start with an address). Note: an array or a string
+# on multi-lines is counted for 1.
+NB_LINES_TO_DISASM = 150
 
 # Save disassembled instructions in a cache
 CAPSTONE_CACHE_SIZE = 60000

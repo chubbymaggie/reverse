@@ -25,7 +25,11 @@ from capstone.x86 import (X86_INS_ADD, X86_INS_AND, X86_INS_CMP, X86_INS_DEC,
         X86_INS_JNE, X86_INS_JNO, X86_INS_JNP, X86_INS_JNS, X86_INS_JO,
         X86_INS_JP, X86_INS_JRCXZ, X86_INS_JS, X86_INS_MOV, X86_INS_SHL,
         X86_INS_SAL, X86_INS_SAR, X86_OP_IMM, X86_OP_MEM, X86_OP_REG,
-        X86_INS_SHR, X86_INS_SUB, X86_INS_XOR, X86_INS_OR, X86_INS_MOVSX)
+        X86_INS_SHR, X86_INS_SUB, X86_INS_XOR, X86_INS_OR, X86_INS_MOVSX,
+        X86_REG_RSP, X86_REG_ESP, X86_REG_SP, X86_INS_PUSH, X86_INS_LEAVE,
+        X86_INS_POPAW, X86_INS_POPAL, X86_INS_POPF, X86_INS_POPFD, X86_INS_POPFQ,
+        X86_INS_PUSHAW, X86_INS_PUSHAL, X86_INS_PUSHF, X86_INS_PUSHFD,
+        X86_INS_PUSHFQ, X86_INS_PUSH, X86_INS_POP)
 
 
 OP_IMM = X86_OP_IMM
@@ -38,6 +42,12 @@ PROLOGS = [
     [b"\x55\x89\xe5"], # push ebp; mov ebp, esp
     [b"\x55\x48\x89\xe5"], # push rbp; mov rbp, rsp
 ]
+
+PUSHPOP = {
+    X86_INS_POPAW, X86_INS_POPAL, X86_INS_POPF, X86_INS_POPFD, X86_INS_POPFQ,
+    X86_INS_PUSHAW, X86_INS_PUSHAL, X86_INS_PUSHF, X86_INS_PUSHFD, X86_INS_PUSHFQ,
+    X86_INS_PUSH, X86_INS_POP,
+}
 
 
 def is_cmp(i):
@@ -58,6 +68,9 @@ def is_ret(i):
 
 def is_call(i):
     return i.group(CS_GRP_CALL)
+
+def is_pushpop(i):
+    return i.id in PUSHPOP
 
 
 OPPOSITES = [
@@ -99,13 +112,13 @@ INST_SYMB = {
     X86_INS_JB: "(unsigned) <",
 
     # other flags
-    X86_INS_JNS: ">",
+    X86_INS_JNS: ">=",
     X86_INS_JS: "<",
     X86_INS_JP: "% 2 ==",
     X86_INS_JNP: "% 2 !=",
     X86_INS_JCXZ: "cx ==",
     X86_INS_JECXZ: "ecx ==",
-    X86_INS_JRCXZ: "rxc ==",
+    X86_INS_JRCXZ: "rcx ==",
     X86_INS_JNO: "overflow",
     X86_INS_JO: "!overflow",
 
@@ -134,3 +147,79 @@ def cond_symbol(ty):
 
 def inst_symbol(i):
     return INST_SYMB.get(i.id, "UNKNOWN")
+
+
+def guess_frame_size(analyzer, ad):
+    regsctx = analyzer.arch_analyzer.new_regs_context()
+    if regsctx is None:
+        return -1
+
+    while 1:
+        i = analyzer.disasm(ad)
+        if i is None or is_ret(i) or is_call(i) or is_cond_jump(i):
+            return 0
+
+        # Do only registers simulation
+        analyzer.arch_analyzer.analyze_operands(analyzer, regsctx, i, None, True)
+
+        if i.id == X86_INS_SUB:
+            op = i.operands[0]
+            if op.type == X86_OP_REG and (op.value.reg == X86_REG_RSP or
+                    op.value.reg == X86_REG_ESP or op.value.reg == X86_REG_SP):
+                # Continue a bit...
+                ad += i.size
+                while 1:
+                    i = analyzer.disasm(ad)
+                    if i is None or is_ret(i) or is_call(i) or is_jump(i) or \
+                            i.id == X86_INS_PUSH or i.id == X86_INS_LEAVE:
+                        return - analyzer.arch_analyzer.get_sp(regsctx)
+                    analyzer.arch_analyzer.analyze_operands(
+                            analyzer, regsctx, i, None, True)
+                    ad += i.size
+
+        ad += i.size
+
+
+def search_jmptable_addr(analyzer, jump_i, inner_code):
+    jump_ty = jump_i.operands[0].type
+
+    if jump_ty == X86_OP_MEM:
+        op = jump_i.operands[0]
+        if op.mem.index != 0 and analyzer.dis.binary.is_address(op.mem.disp):
+            return op.mem.disp
+        return None
+
+    if jump_ty != X86_OP_REG:
+        return None
+
+    jump_reg = jump_i.operands[0].value.reg
+    ad = jump_i.address - 1
+    n = 0
+    end = ad - 64
+
+    # Search max 5 instructions backward
+    while n < 5 and ad >= end:
+        # We can't check analyzer.db.mem.is_code because when this function
+        # is called, instructions are not pushed in memory. We have only
+        # the set of the function.
+        if ad in inner_code:
+            n -= 1
+            i = inner_code[ad]
+            if i is None:
+                return None
+            if is_jump(i):
+                return None
+            if len(i.operands) >= 1:
+                op1 = i.operands[0]
+                if op1.type == X86_OP_REG and op1.value.reg == jump_reg:
+                    if len(i.operands) != 2:
+                        return None
+                    op2 = i.operands[1]
+                    if op2.type != X86_OP_MEM:
+                        return None
+                    if analyzer.dis.binary.is_address(op2.mem.disp):
+                        return op2.mem.disp
+                    return None
+        ad -= 1
+
+    return None

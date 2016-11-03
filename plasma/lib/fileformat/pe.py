@@ -17,6 +17,10 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
+# http://wiki.osdev.org/COFF
+# http://www.delorie.com/djgpp/doc/coff/symtab.html
+# http://unixwiz.net/techtips/win32-callconv.html
+
 import bisect
 
 import pefile
@@ -49,20 +53,19 @@ class PE(Binary):
         base = self.pe.OPTIONAL_HEADER.ImageBase
 
         for s in self.pe.sections:
+            name = s.Name.decode().rstrip(' \0')
             self.add_section(
                 base + s.VirtualAddress,
-                s.Name.decode().rstrip(' \0'),
+                name,
                 s.Misc_VirtualSize,
                 s.SizeOfRawData,
                 self.__section_is_exec(s),
                 self.__section_is_data(s),
+                name == ".bss",
                 s.get_data())
 
 
     def load_static_sym(self):
-        # http://wiki.osdev.org/COFF
-        # http://www.delorie.com/djgpp/doc/coff/symtab.html
-
         sym_table_off = self.pe.FILE_HEADER.PointerToSymbolTable
         n_sym = self.pe.FILE_HEADER.NumberOfSymbols
         string_table_off = sym_table_off + sizeof(SymbolEntry) * n_sym
@@ -170,6 +173,8 @@ class PE(Binary):
 
         self.reverse_symbols[first_inst.address] = name
         self.symbols[name] = first_inst.address
+
+        self.api.add_xref(first_inst.address, ptr)
 
         if ty != -1:
             self.db.mem.add(first_inst.address, 1, ty)

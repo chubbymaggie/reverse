@@ -36,7 +36,7 @@ from plasma.lib.utils import info, warning, die
 from plasma.lib.memory import Memory
 
 
-VERSION = 2.1
+VERSION = 2.6
 
 
 class Database():
@@ -56,19 +56,26 @@ class Database():
         self.user_previous_comments = {}
         self.internal_previous_comments = {}
         self.jmptables = {}
-        self.mips_gp = -1
+        self.mips_gp = 0
         self.modified = False
         self.loaded = False
-        self.mem = None
+        self.mem = None # see lib.memory
         # func address ->
-        #  [ end addr, flags,
-        #       dict vars_off -> [type, name],
-        #       func_id,
-        #       dict inst.address -> [var_off]
+        #  [ end addr,
+        #    flags,
+        #    dict vars_off -> [type, name],
+        #    func_id,
+        #    dict inst.address -> [var_off],
+        #    frame_size,
+        #  ]
         self.functions = {}
         self.func_id = {} # id -> func address
         self.xrefs = {} # addr -> list addr
+        # For big data (arrays/strings) we save all addresses with an xrefs
+        self.data_sub_xrefs = {} # data_address -> {addresses_with_xrefs: True}
         self.imports = {} # ad -> True (the bool is just for msgpack to save the database)
+        self.immediates = {} # insn_ad -> immediate result
+
         self.raw_base = 0
         self.raw_type = None
         self.raw_is_big_endian = None
@@ -93,13 +100,11 @@ class Database():
 
             fd = open(self.path, "rb")
 
-            data = self.__check_old_json_db(fd)
-            if data is None:
-                data = fd.read()
-                if data.startswith(b"ZLIB"):
-                    data = zlib.decompress(data[4:])
-                data = msgpack.unpackb(data, encoding="utf-8")
-                fd.close()
+            data = fd.read()
+            if data.startswith(b"ZLIB"):
+                data = zlib.decompress(data[4:])
+            data = msgpack.unpackb(data, encoding="utf-8")
+            fd.close()
 
             self.__load_meta(data)
             self.__load_memory(data)
@@ -110,6 +115,7 @@ class Database():
             self.__load_history(data)
             self.__load_xrefs(data)
             self.__load_imports(data)
+            self.__load_immediates(data)
 
             if self.version <= 1.5:
                 self.__load_labels(data)
@@ -138,11 +144,15 @@ class Database():
             "mips_gp": self.mips_gp,
             "mem": self.mem.mm,
             "functions": self.functions,
+            "func_id_counter": self.func_id_counter,
             "func_id": self.func_id,
             "xrefs": self.xrefs,
+            "data_sub_xrefs": self.data_sub_xrefs,
             "raw_base": self.raw_base,
             "raw_type": self.raw_type,
             "raw_is_big_endian": self.raw_is_big_endian,
+            "imports": self.imports,
+            "immediates": self.immediates,
         }
 
         for j in self.jmptables.values():
@@ -182,14 +192,9 @@ class Database():
 
 
     def __load_labels(self, data):
-        try:
-            for name, ad in self.labels.items():
-                self.reverse_symbols[ad] = name
-                self.symbols[name] = ad
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
+        for name, ad in self.labels.items():
+            self.reverse_symbols[ad] = name
+            self.symbols[name] = ad
 
 
     def __load_comments(self, data):
@@ -200,126 +205,53 @@ class Database():
 
 
     def __load_jmptables(self, data):
-        try:
-            for j in data["jmptables"]:
-                self.jmptables[j["inst_addr"]] = \
-                    Jmptable(j["inst_addr"], j["table_addr"], j["table"], j["name"])
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
+        for j in data["jmptables"]:
+            self.jmptables[j["inst_addr"]] = \
+                Jmptable(j["inst_addr"], j["table_addr"], j["table"], j["name"])
 
 
     def __load_meta(self, data):
-        try:
-            self.mips_gp = data["mips_gp"]
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
-
-        try:
-            self.version = data["version"]
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            self.version = -1
-            pass
-
-        if self.version >= 1.10:
-            self.raw_base = data["raw_base"]
-            self.raw_type = data["raw_type"]
-            self.raw_is_big_endian = data["raw_is_big_endian"]
+        self.mips_gp = data["mips_gp"]
+        self.version = data["version"]
 
 
     def __load_memory(self, data):
         self.mem = Memory()
-
-        try:
-            if self.version == -1:
-                self.mem.mm = data["mem_code"]
-                for ad in self.mem.mm:
-                    self.mem.mm[ad].append(-1)
-                return
-
-            self.mem.mm = data["mem"]
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
+        self.mem.mm = data["mem"]
 
 
     def __load_history(self, data):
         self.history = data["history"]
 
 
+    def __load_immediates(self, data):
+        self.immediates = data["immediates"]
+
+
     def __load_xrefs(self, data):
-        try:
-            self.xrefs = data["xrefs"]
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
+        self.xrefs = data["xrefs"]
+        self.data_sub_xrefs = data["data_sub_xrefs"]
 
 
     def __load_imports(self, data):
-        try:
-            self.imports = data["imports"]
-        except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
+        self.imports = data["imports"]
 
 
     def __load_functions(self, data):
-        try:
-            self.functions = data["functions"]
+        self.functions = data["functions"]
 
-            if self.version <= 1.7:
-                for fad, value in self.functions.items():
-                    value.append({}) # dict vars
-
-            if self.version <= 1.9:
-                for fad, value in self.functions.items():
-                    value.append(0) # func_id, will fail if we redefine a function...
-
-            for fad, value in self.functions.items():
-                # end of the function
+        for fad, value in self.functions.items():
+            # end of the function
+            if value is not None:
                 e = value[0]
                 if e in self.end_functions:
                     self.end_functions[e].append(fad)
                 else:
                     self.end_functions[e] = [fad]
 
-                self.func_id = data["func_id"]
+        self.func_id = data["func_id"]
 
-            self.func_id_counter = max(self.func_id) + 1
-
+        try:
+            self.func_id_counter = data["func_id_counter"]
         except:
-            # Not available in previous versions, this try will be
-            # removed in the future
-            pass
-
-
-    def __check_old_json_db(self, fd):
-        c = fd.read(1)
-        fd.seek(0)
-        if c == b"{":
-            fd = open(self.path, "r")
-            data = json.loads(fd.read())
-            fd.close()
-
-            try:
-                data["user_inline_comments"] = data["inline_comments"]
-                data["user_previous_comments"] = data["previous_comments"]
-                del data["inline_comments"]
-                del data["previous_comments"]
-            except:
-                data["user_inline_comments"] = {}
-                data["user_previous_comments"] = {}
-
-            data["internal_inline_comments"] = {}
-            data["internal_previous_comments"] = {}
-
-            return data
-        return None
+            self.func_id_counter = max(self.func_id.keys()) + 1

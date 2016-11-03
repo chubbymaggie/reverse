@@ -24,12 +24,14 @@ from plasma.lib.utils import unsigned
 from plasma.lib.fileformat.binary import T_BIN_PE, T_BIN_ELF
 from plasma.lib.consts import *
 
+ALL_SP = {}
+
 
 class Analyzer(threading.Thread):
     def init(self):
         self.dis = None
         self.msg = Queue()
-        self.pending = set() # prevent recursive call
+        self.pending = set() # to avoid recursion
 
         self.running_second_pass = False
         self.where = 0 # cursor when parsing memory
@@ -53,10 +55,22 @@ class Analyzer(threading.Thread):
         self.functions = self.db.functions
         self.prologs = self.ARCH_UTILS.PROLOGS
         self.arch_analyzer = arch_analyzer
+        self.arch_analyzer.set_wordsize(self.dis.wordsize)
+
+        if self.dis.wordsize == 2:
+            self.OFFSET_TYPE = MEM_WOFFSET
+        elif self.dis.wordsize == 4:
+            self.OFFSET_TYPE = MEM_DOFFSET
+        elif self.dis.wordsize == 8:
+            self.OFFSET_TYPE = MEM_QOFFSET
 
 
-    # Should be rewritten for mips
     def __add_prefetch(self, addr_set, inst):
+        if self.dis.is_mips:
+            prefetch = self.disasm(inst.address + inst.size)
+            if prefetch is not None:
+                addr_set[prefetch.address] = prefetch
+            return prefetch
         return None
 
 
@@ -70,6 +84,31 @@ class Analyzer(threading.Thread):
         elif self.dis.binary.type == T_BIN_ELF:
             return FUNC_FLAG_NORETURN if name in NORETURN_ELF else 0
         return 0
+
+
+    #
+    # Cdecl calling convention recall :
+    # Note: stack offsets are negatives !
+    #
+    # push rax
+    # push rbx          ----> sp_after_push = -frame_size - 8*2
+    # call func
+    # ...
+    #
+    # rsp is reset to -frame_size (see in __sub_analyze_flow before the
+    # is_call). This is for working correclty with stdcall.
+    # But for cdecl, the rsp is restored with an add :
+    #
+    # add rsp, 16       ----> curr_sp = -frame_size + 16
+    #
+    # FIXME: if we have for example multiple "add rsp" to give the same
+    # result as add rsp, 16
+    #
+    def handle_cdecl(self, frame_size, sp_after_push, curr_sp):
+        # It means there was an add instruction so we restore curr_sp to
+        # sp_after_push with the current difference.
+        return -curr_sp < frame_size and \
+            frame_size - -curr_sp == -sp_after_push - frame_size
 
 
     def run(self):
@@ -100,6 +139,79 @@ class Analyzer(threading.Thread):
                     else:
                         self.msg.put(item)
 
+                elif item == "rename_entry_point":
+                    self.rename_entry_point()
+
+                    
+    def rename_entry_point(self):
+        def new_function(ad, name):
+            if name not in self.db.symbols:
+                self.api.add_symbol(imm, name)
+            self.analyze_flow(
+                    imm,
+                    entry_is_func=True,
+                    force=False,
+                    add_if_code=False)
+
+        if self.dis.binary.type != T_BIN_ELF or not self.dis.is_x86:
+            return
+
+        from capstone.x86 import (X86_REG_RDI, X86_REG_RCX, X86_REG_R8,
+                                  X86_INS_MOV, X86_OP_REG, X86_OP_IMM,
+                                  X86_INS_PUSH)
+
+        ep = self.api.entry_point()
+        insn_count = 10
+        arg_count = 0 # counter for x86
+
+        if "_start" not in self.db.symbols:
+            self.api.add_symbol(ep, "_start")
+
+        ad = self.api.get_addr_from_symbol("__libc_start_main")
+        if ad == -1:
+            return
+
+        try:
+            ad = next(iter(self.api.xrefsto(ad)))
+        except:
+            return
+
+        while insn_count != 0 and ad != ep:
+            if self.db.mem.is_code(ad):
+                insn = self.api.disasm(ad)
+
+                if self.dis.binary.arch == "x86":
+                    if insn.id == X86_INS_PUSH and \
+                            insn.operands[0].type == X86_OP_IMM:
+                        imm = insn.operands[0].value.imm
+
+                        if arg_count == 0:
+                            new_function(imm, "main")
+                        elif arg_count == 1:
+                            new_function(imm, "__libc_csu_init")
+                        elif arg_count == 2:
+                            new_function(imm, "__libc_csu_fini")
+                        arg_count += 1
+
+                else: # x64
+                    if insn.id == X86_INS_MOV and \
+                            insn.operands[0].type == X86_OP_REG and \
+                            insn.operands[1].type == X86_OP_IMM:
+
+                        reg = insn.operands[0].value.reg
+                        imm = insn.operands[1].value.imm
+
+                        if reg == X86_REG_RDI:
+                            new_function(imm, "main")
+                        elif reg == X86_REG_RCX:
+                            new_function(imm, "__libc_csu_init")
+                        elif reg == X86_REG_R8:
+                            new_function(imm, "__libc_csu_fini")
+
+                insn_count -= 1
+
+            ad -= 1
+
 
     def pass_detect_unk_data(self):
         b = self.dis.binary
@@ -107,7 +219,7 @@ class Analyzer(threading.Thread):
         wait = Queue()
 
         for s in b.iter_sections():
-            if s.is_exec:
+            if s.is_exec or s.is_bss:
                 continue
 
             ad = s.start
@@ -127,22 +239,33 @@ class Analyzer(threading.Thread):
                     s2 = b.get_section(val)
                     if s2 is not None and s2.is_exec:
                         self.api.add_xref(ad, val)
-                        self.db.mem.add(ad, self.dis.wordsize, MEM_OFFSET)
+                        self.db.mem.add(ad, self.dis.wordsize, self.OFFSET_TYPE)
                         ad += self.dis.wordsize
 
-                        if not self.db.mem.exists(val):
+                        # is_overlapping is sufficient but exists is faster
+                        # and should be check first.
+                        if not self.db.mem.exists(val) and \
+                                not self.db.mem.is_overlapping(val):
                             self.db.mem.add(val, self.dis.wordsize, MEM_UNK)
-
                             # Do an analysis on this value.
-                            if val not in self.pending and \
-                                    self.first_inst_are_code(val):
-                                self.analyze_flow(val, self.has_prolog(val), False, True)
+                            if s.is_exec and self.first_inst_are_code(val):
+                                self.analyze_flow(
+                                        val,
+                                        entry_is_func=self.has_prolog(val),
+                                        force=False,
+                                        add_if_code=True)
+
                         continue
 
                 # Detect if it's a string
                 n = b.is_string(ad, s=s)
                 if n != 0:
-                    self.db.mem.add(ad, n, MEM_ASCII)
+                    # is_overlapping is sufficient but exists is faster
+                    # and should be check first.
+                    if ad not in self.db.imports and \
+                            not self.db.mem.exists(ad) and \
+                            not self.db.mem.is_overlapping(ad):
+                        self.db.mem.add(ad, n, MEM_ASCII)
                     ad += n
                     continue
 
@@ -154,7 +277,7 @@ class Analyzer(threading.Thread):
         mem = self.db.mem
 
         for s in b.iter_sections():
-            if not s.is_exec:
+            if not s.is_exec or s.is_bss:
                 continue
 
             ad = s.start
@@ -169,60 +292,77 @@ class Analyzer(threading.Thread):
 
                 # Do an analysis on this value.
                 # Don't run first_inst_are_code, it's too slow on big sections.
-                if ad not in self.pending and self.has_prolog(ad):
+                if self.has_prolog(ad):
                     # Don't push, run directly the analyzer. Otherwise
                     # we will re-analyze next instructions.
-                    self.analyze_flow(ad, True, False, True)
+                    self.analyze_flow(
+                            ad,
+                            entry_is_func=True,
+                            force=False,
+                            add_if_code=True)
 
                 ad += 1
 
 
     # Do an analysis if the immediate is an address
-    def analyze_imm(self, i, op, imm):
+    def analyze_imm(self, i, op, imm, is_register):
+        if imm <= 1024:
+            return False
+
+        if not is_register and op.type != self.ARCH_UTILS.OP_MEM and \
+                op.type != self.ARCH_UTILS.OP_IMM:
+            return False
+
+
+        # imm must be an address
         s = self.dis.binary.get_section(imm)
         if s is None or s.start == 0:
-            return
+            return False
 
         self.api.add_xref(i.address, imm)
+        ad = imm
 
-        if self.db.mem.exists(imm):
-            return
+        # is_overlapping is sufficient but exists is faster
+        # and should be checked first.
+        if self.db.mem.exists(ad) or self.db.mem.is_overlapping(ad):
+            return True
+
+        if not s.is_bss:
+            sz = self.dis.wordsize
+
+            # If *(*ad) is an address
+            deref = s.read_int(ad, sz)
+            if deref is not None and self.dis.binary.is_address(deref):
+                ty = self.db.mem.get_type_from_size(sz)
+                self.api.set_offset(ad, ty, async_analysis=False)
+                return True
+
+            # Check if this is an address to a string
+            if ad not in self.db.imports:
+                sz = self.dis.binary.is_string(ad)
+                if sz != 0:
+                    self.db.mem.add(ad, sz, MEM_ASCII)
+                    return True
 
         sz = op.size if self.dis.is_x86 else self.dis.wordsize
-        deref = s.read_int(imm, sz)
-
-        # If (*imm) is an address
-        if deref is not None and self.dis.binary.is_address(deref):
-            ty = MEM_OFFSET
-            self.api.add_xref(imm, deref)
-
-            if not self.db.mem.exists(deref):
-                self.db.mem.add(deref, 1, MEM_UNK)
-
-                # Do an analysis on this value.
-                if deref not in self.pending and \
-                        self.first_inst_are_code(deref):
-                    self.analyze_flow(deref, self.has_prolog(deref), False, True)
+        if op.type == self.ARCH_UTILS.OP_MEM:
+            ty = self.db.mem.get_type_from_size(sz)
         else:
-            # Check if this is an address to a string
-            sz = self.dis.binary.is_string(imm)
-            if sz != 0:
-                ty = MEM_ASCII
-            else:
-                sz = op.size if self.dis.is_x86 else self.dis.wordsize
-                if op.type == self.ARCH_UTILS.OP_MEM:
-                    ty = self.db.mem.find_type(sz)
-                else:
-                    ty = MEM_UNK
+            ty = MEM_UNK
 
-        self.db.mem.add(imm, sz, ty)
+        self.db.mem.add(ad, sz, ty)
 
         if ty == MEM_UNK:
             # Do an analysis on this value, if this is not code
             # nothing will be done.
-            if imm not in self.pending and \
-                    self.first_inst_are_code(imm):
-                self.analyze_flow(imm, self.has_prolog(imm), True, True)
+            if s.is_exec and self.first_inst_are_code(ad):
+                self.analyze_flow(
+                        ad,
+                        entry_is_func=self.has_prolog(ad),
+                        force=True,
+                        add_if_code=True)
+
+        return True
 
 
     # Check if the five first instructions can be disassembled.
@@ -276,7 +416,8 @@ class Analyzer(threading.Thread):
         return False
 
 
-    def __add_analyzed_code(self, func_obj, mem, entry, inner_code, entry_is_func, flags):
+    def __add_analyzed_code(self, func_obj, mem, entry, inner_code,
+                            entry_is_func, flags):
         if func_obj is not None:
             e = max(inner_code) if inner_code else -1
             func_id = func_obj[FUNC_ID]
@@ -308,6 +449,43 @@ class Analyzer(threading.Thread):
         return ad != entry and self.functions[ad][FUNC_FLAGS] & FUNC_FLAG_NORETURN
 
 
+    def auto_jump_table(self, i, inner_code):
+        table_ad = self.ARCH_UTILS.search_jmptable_addr(self, i, inner_code)
+        if table_ad is None:
+            return False
+
+        s_orig = self.dis.binary.get_section(table_ad)
+        nb_entries = 0
+        ad = table_ad
+
+        while 1:
+            val = s_orig.read_int(ad, self.dis.wordsize)
+            if val is None:
+                return False
+
+            if not self.dis.binary.is_address(val):
+                break
+
+            nb_entries += 1
+            ad += self.dis.wordsize
+
+            # TODO : here the program is not completely analyzed, so new xrefs
+            # can appears later.
+            if ad in self.db.xrefs:
+                break
+
+            s = self.dis.binary.get_section(ad)
+
+            if s is None or s.start != s_orig.start:
+                break
+
+        if nb_entries:
+            return self.api.create_jmptable(
+                i.address, table_ad, nb_entries, self.dis.wordsize, dont_analyze=True)
+
+        return False
+
+
     #
     # analyze_flow:
     # entry             address of the code to analyze.
@@ -315,27 +493,38 @@ class Analyzer(threading.Thread):
     #                   instructions will be set only as "code".
     # force             if true and entry is already functions, the analysis
     #                   is forced.
-    # add_if_code       if true, it means that we are not sure that entry is an
+    # add_if_code       if true, it means that we are not sure the entry is an
     #                   address to a code location. In this case, if the control
     #                   flow contains a bad instruction, the functions or
     #                   instructions will not be added.
+    # return stack offset : if this is not a function, it returns any value.
     #
     def analyze_flow(self, entry, entry_is_func, force, add_if_code):
         if entry in self.pending:
             return
+
+        if self.dis.binary.get_section(entry) is None:
+           return
+
+        is_def = entry in self.functions
 
         if not force:
             if not entry_is_func and self.db.mem.is_loc(entry) or \
                     entry_is_func and self.db.mem.is_func(entry):
                 return
 
-            # Check if is not inside a function
+            # Check if this is not inside a function
             if self.db.mem.get_func_id(entry) != -1:
                 return
 
+        # If the address is in the symbol table there is an entry in
+        # self.functions but the value is init to None.
+        if not entry_is_func and is_def and self.functions[entry] is None:
+            entry_is_func = True
+
         mem = self.db.mem
 
-        if mem.is_inside_mem(entry):
+        if mem.is_overlapping(entry):
             return
 
         self.pending.add(entry)
@@ -344,8 +533,7 @@ class Analyzer(threading.Thread):
 
         is_pe_import = False
 
-        # Check if it's a jump to an imported symbol
-        # jmp *(IMPORT)
+        # Check if it's a jump to an imported symbol : jmp *(IMPORT)
         if self.dis.binary.type == T_BIN_PE:
             if entry in self.dis.binary.imports:
                 is_pe_import = True
@@ -359,9 +547,8 @@ class Analyzer(threading.Thread):
                         flags = self.import_flags(ptr)
 
         # Create a function object (see in Database)
-        is_def = entry in self.functions
 
-        if entry_is_func or is_def:
+        if entry_is_func:
             # It can be None because when symbols are loaded functions are
             # set to None initially.
             if is_def and self.functions[entry] is not None:
@@ -370,17 +557,26 @@ class Analyzer(threading.Thread):
                 if not self.db.end_functions[last_end]:
                     del self.db.end_functions[last_end]
 
-            # [func_end, flags, var_offsets, func_id, inst.addresses]
-            func_obj = [-1, 0, {}, self.db.func_id_counter, {}]
+            # [func_end,
+            #  flags,
+            #  var_offsets,
+            #  func_id,
+            #  inst.addresses,
+            #  stack_offset,
+            #  frame_size]
+            func_obj = [-1, 0, {}, self.db.func_id_counter, {}, 0, -1]
             self.db.func_id_counter += 1
-
         else:
             func_obj = None
 
+        do_save = True
+
         if not is_pe_import and not inner_code:
             flags = self.__sub_analyze_flow(func_obj, entry, inner_code, add_if_code)
+            if flags == -1:
+                do_save = False
 
-        if inner_code and flags != -1:
+        if inner_code and do_save:
             self.__add_analyzed_code(func_obj, self.db.mem, entry, inner_code,
                                      entry_is_func, flags)
 
@@ -388,12 +584,9 @@ class Analyzer(threading.Thread):
         self.pending.remove(entry)
 
 
+    # Returns a tuple (flags, sp) or None if an error occurs
+    # flags is equal to 
     def __sub_analyze_flow(self, func_obj, entry, inner_code, add_if_code):
-        if self.dis.binary.get_section(entry) is None:
-            return -1
-
-        has_ret = False
-
         # If entry is not "code", we have to rollback added xrefs
         has_bad_inst = False
         if add_if_code:
@@ -402,13 +595,17 @@ class Analyzer(threading.Thread):
         regsctx = self.arch_analyzer.new_regs_context()
         if regsctx is None:
             # fatal error, but don't quit to let the user save the database
-            return 0
+            return -1
 
-        # FIXME : this is a hack for the cdecl calling convention
-        # if the stack pointer move after a call, this is probably a cdecl
-        # call, so we will ignore the add instruction.
-        one_call_called = False
+        if func_obj is not None:
+            frame_size = self.ARCH_UTILS.guess_frame_size(self, entry)
+            func_obj[FUNC_FRAME_SIZE] = frame_size
+        else:
+            frame_size = -1
 
+        sp_after_push = 0
+        last_call = None
+        has_ret = False
         stack = [(regsctx, entry)]
 
         while stack:
@@ -424,44 +621,67 @@ class Analyzer(threading.Thread):
             if ad in inner_code:
                 continue
 
+            if self.gctx.debugsp:
+                ALL_SP[ad] = self.arch_analyzer.get_sp(regsctx)
+
             inner_code[ad] = inst
 
-            self.arch_analyzer.analyze_operands(
-                    self, regsctx, inst, func_obj, one_call_called)
-
+            ##### RETURN #####
             if self.is_ret(inst):
                 self.__add_prefetch(inner_code, inst)
                 has_ret = True
 
+            ##### UNCONDITIONAL JUMP #####
             elif self.is_uncond_jump(inst):
                 self.__add_prefetch(inner_code, inst)
-
                 op = inst.operands[-1]
+                jmp_ad = None
 
                 if op.type == self.ARCH_UTILS.OP_IMM:
-                    nxt = unsigned(op.value.imm)
-                    self.api.add_xref(ad, nxt)
-                    if self.db.mem.is_func(nxt):
-                        has_ret = not self.is_noreturn(nxt, entry)
-                    else:
-                        stack.append((regsctx, nxt))
-                    if add_if_code:
-                        added_xrefs.append((ad, nxt))
+                    jmp_ad = unsigned(op.value.imm)
+
                 else:
-                    if inst.address in self.jmptables:
+                    is_jmptable = inst.address in self.jmptables
+
+                    # Create a jumptable if necessary
+                    if not is_jmptable:
+                        if op.type == self.ARCH_UTILS.OP_REG:
+                            jmp_ad = self.arch_analyzer.reg_value(regsctx, op.value.reg)
+                            if jmp_ad is None:
+                                is_jmptable = self.auto_jump_table(inst, inner_code)
+
+                        elif op.type == self.ARCH_UTILS.OP_MEM:
+                            self.arch_analyzer.analyze_operands(
+                                    self, regsctx, inst, func_obj, False)
+                            is_jmptable = self.auto_jump_table(inst, inner_code)
+
+                    if is_jmptable:
                         table = self.jmptables[inst.address].table
-                        # TODO : dupplicate regsctx ??
                         for n in table:
-                            stack.append((regsctx, n))
-                        self.api.add_xref(ad, table)
+                            r = self.arch_analyzer.clone_regs_context(regsctx)
+                            stack.append((r, n))
+                        self.api.add_xrefs_table(ad, table)
                         if add_if_code:
                             added_xrefs.append((ad, table))
-                    else:
-                        # TODO
-                        # This is a register or a memory access
-                        # we can't say if the function really returns
-                        has_ret = True
+                        continue
 
+                    self.arch_analyzer.analyze_operands(
+                            self, regsctx, inst, func_obj, False)
+                    # TODO: assume it has a return
+                    if jmp_ad is None:
+                        has_ret = True
+                        continue
+
+                self.api.add_xref(ad, jmp_ad)
+                if self.db.mem.is_func(jmp_ad):
+                    has_ret = not self.is_noreturn(jmp_ad, entry)
+                else:
+                    stack.append((regsctx, jmp_ad))
+                if add_if_code:
+                    added_xrefs.append((ad, jmp_ad))
+
+
+            ##### CONDITIONAL JUMP #####
             elif self.is_cond_jump(inst):
                 prefetch = self.__add_prefetch(inner_code, inst)
 
@@ -474,7 +694,11 @@ class Analyzer(threading.Thread):
 
                     nxt_jmp = unsigned(unsigned(op.value.imm))
                     self.api.add_xref(ad, nxt_jmp)
-                    stack.append((regsctx, direct_nxt))
+
+                    if self.db.mem.is_func(direct_nxt):
+                        has_ret = not self.is_noreturn(direct_nxt, entry)
+                    else:
+                        stack.append((regsctx, direct_nxt))
 
                     if add_if_code:
                         added_xrefs.append((ad, nxt_jmp))
@@ -484,52 +708,101 @@ class Analyzer(threading.Thread):
                     else:
                         newctx = self.arch_analyzer.clone_regs_context(regsctx)
                         stack.append((newctx, nxt_jmp))
+                else:
+                    self.arch_analyzer.analyze_operands(
+                            self, regsctx, inst, func_obj, False)
+                    # TODO : jump tables for conditional jumps ?
 
+            ##### CALL #####
             elif self.is_call(inst):
-                one_call_called = True
                 op = inst.operands[-1]
-                value = None
+                call_ad = None
 
                 if op.type == self.ARCH_UTILS.OP_IMM:
-                    value = unsigned(op.value.imm)
+                    call_ad = unsigned(op.value.imm)
                 elif op.type == self.ARCH_UTILS.OP_REG:
                     # FIXME : for MIPS, addresses are loaded in t9 (generally)
                     # then jalr t9 is executed. The problem here is that we
                     # will analyze twice the function. The first time is done
                     # by the function analyze_imm.
-                    value = self.arch_analyzer.reg_value(regsctx, op.value.reg)
+                    call_ad = self.arch_analyzer.reg_value(regsctx, op.value.reg)
+                else:
+                    self.arch_analyzer.analyze_operands(
+                            self, regsctx, inst, func_obj, False)
 
-                if value is not None:
-                    self.api.add_xref(ad, value)
+                if call_ad is not None:
+                    last_call = call_ad
+                    self.api.add_xref(ad, call_ad)
 
                     if add_if_code:
-                        added_xrefs.append((ad, value))
+                        added_xrefs.append((ad, call_ad))
 
-                    if not self.db.mem.is_func(value):
-                        self.analyze_flow(value, True, False, add_if_code)
+                    self.analyze_flow(
+                            call_ad,
+                            entry_is_func=True,
+                            force=False,
+                            add_if_code=add_if_code)
 
-                    if self.db.mem.is_func(value) and self.is_noreturn(value, entry):
-                        self.__add_prefetch(inner_code, inst)
-                        continue
+                    # Reset the stack pointer to frame_size to handle stdcall.
+                    if frame_size != -1:
+                        sp_after_push = self.arch_analyzer.get_sp(regsctx)
+                        if frame_size != - sp_after_push:
+                            self.arch_analyzer.set_sp(regsctx, -frame_size)
+
+                    if self.db.mem.is_func(call_ad):
+                        if self.is_noreturn(call_ad, entry):
+                            self.__add_prefetch(inner_code, inst)
+                            continue
 
                 nxt = inst.address + inst.size
                 stack.append((regsctx, nxt))
 
+            ##### OTHERS #####
             else:
-                nxt = inst.address + inst.size
-                stack.append((regsctx, nxt))
+                if frame_size != -1:
+                    sp_before = self.arch_analyzer.get_sp(regsctx)
 
+                self.arch_analyzer.analyze_operands(
+                        self, regsctx, inst, func_obj, False)
+
+                # FIXME: reload after the previous call to handle correctly
+                # the cdecl.
+
+                # See also FIXME in handle_cdecl
+
+                # Restore the stack pointer to sp_after_push to handle cdecl.
+                if frame_size != -1:
+                    curr_sp = self.arch_analyzer.get_sp(regsctx)
+                    if curr_sp != sp_before and \
+                            self.handle_cdecl(frame_size, sp_after_push, curr_sp):
+
+                        new_sp = sp_after_push - (sp_before - curr_sp)
+                        self.arch_analyzer.set_sp(regsctx, new_sp)
+
+                        if last_call is not None and self.db.mem.is_func(last_call):
+                            self.functions[last_call][FUNC_FLAGS] |= FUNC_FLAG_CDECL
+
+                        if self.gctx.debugsp:
+                            ALL_SP[ad] = sp_after_push
+
+                        sp_after_push = 0
+
+                nxt = inst.address + inst.size
+                if nxt not in self.functions:
+                    stack.append((regsctx, nxt))
+
+        # Remove all xrefs, this is not a correct flow
         if add_if_code and has_bad_inst:
             for from_ad, to_ad in added_xrefs:
-                self.api.rm_xrefs(from_ad, to_ad)
+                if isinstance(to_ad, list):
+                    self.api.rm_xrefs_table(from_ad, to_ad)
+                else:
+                    self.api.rm_xref(from_ad, to_ad)
             return -1
 
-        # for ELF
-        if entry in self.dis.binary.imports:
-            flags = self.import_flags(entry)
-        elif has_ret:
-            flags = 0
-        else:
+        # Set function flags
+        flags = self.import_flags(entry)
+        if flags == 0 and not has_ret:
             flags = FUNC_FLAG_NORETURN
 
         return flags

@@ -28,7 +28,7 @@ from plasma.lib.consts import *
 
 
 class Visual(Window):
-    def __init__(self, gctx, ctx, analyzer, api):
+    def __init__(self, gctx, ctx, analyzer, api, stack, saved_stack):
         Window.__init__(self, ctx.output, has_statusbar=True)
 
         self.ctx = ctx
@@ -40,11 +40,13 @@ class Visual(Window):
         self.api = api
 
         # Last/first address printed (only in MODE_DUMP)
-        self.last_addr = max(self.output.addr_line)
+        self.set_last_addr()
         self.first_addr = min(self.output.addr_line)
 
-        self.stack = []
-        self.saved_stack = [] # when we enter, go back, then re-enter
+        self.last_curr_line_ad = None
+
+        self.stack = stack
+        self.saved_stack = saved_stack # when we enter, go back, then re-enter
 
         new_mapping = {
             b"z": self.main_cmd_line_middle,
@@ -52,8 +54,6 @@ class Visual(Window):
             b"G": self.main_k_bottom,
             b";": self.view_inline_comment_editor,
             b"%": self.main_cmd_next_bracket,
-            b"\n": self.main_cmd_enter,
-            b"\x1b": self.main_cmd_escape,
             b"\t": self.main_cmd_switch_mode,
             b"{": self.main_k_prev_paragraph,
             b"}": self.main_k_next_paragraph,
@@ -74,7 +74,11 @@ class Visual(Window):
             b"Q": self.main_cmd_set_qword,
             b"a": self.main_cmd_set_ascii,
             b"o": self.main_cmd_set_offset,
+            b"*": self.main_cmd_set_array,
+            b"U": self.main_cmd_undefine,
 
+            b"\n": self.main_cmd_enter,
+            b"\x1b": self.main_cmd_escape,
             # I wanted ctrl-enter but it cannot be mapped on my terminal
             b"u": self.main_cmd_reenter, # u for undo
         }
@@ -85,10 +89,6 @@ class Visual(Window):
         self.gctx.quiet = True
 
         self.screen = curses.initscr()
-
-        (h, w) = self.screen.getmaxyx()
-        h -= 1 # status bar
-        self.goto_address(self.first_addr, h, w)
 
         curses.noecho()
         curses.cbreak()
@@ -102,8 +102,7 @@ class Visual(Window):
                 curses.init_pair(i, i, -1)
 
             try:
-                curses.init_pair(1, 253, 66) # for the highlight search
-                curses.init_pair(2, 255, 238) # for the status bar
+                curses.init_pair(1, COLOR_SEARCH_FG, COLOR_SEARCH_BG)
             except:
                 curses.nocbreak()
                 curses.echo()
@@ -114,6 +113,16 @@ class Visual(Window):
         else:
             for i in range(0, curses.COLORS):
                 curses.init_pair(i, 7, -1) # white
+
+        (h, w) = self.screen.getmaxyx()
+        h -= 1 # status bar
+
+        # Init some y coordinate, used to compute the cursor position
+        self.init_section_coords()
+
+        self.win_y = self.dump_update_up(h, self.win_y)
+        self.goto_address(ctx.entry, h, w)
+        self.main_cmd_line_middle(h, w)
 
         try:
             curses.wrapper(self.start_view)
@@ -131,27 +140,91 @@ class Visual(Window):
 
         self.gctx.quiet = saved_quiet
 
-        if self.stack:
-            print(hex(self.ctx.entry))
+
+    def init_section_coords(self):
+        self.section_normalized = {}
+        self.total_size = 0
+        for s in self.api.iter_sections():
+            self.section_normalized[s.start] = self.total_size
+            self.total_size += s.virt_size
+
+
+    def get_y_cursor(self, h8, h):
+        if self.mode == MODE_DECOMPILE or self.last_curr_line_ad is None:
+            return Window.get_y_cursor(self, h8, h)
+
+        ad = self.last_curr_line_ad
+        s = self.api.get_section(ad)
+        ad_normalized = self.section_normalized[s.start] + ad - s.start
+        return int(ad_normalized * h8 / self.total_size)
+
+
+    def set_last_addr(self):
+        ad = self.db.mem.get_head_addr(max(self.output.addr_line))
+        ad += self.db.mem.get_size(ad)
+        self.last_addr = ad
 
 
     def exec_disasm(self, addr, h, dump_until=-1):
         self.ctx = self.gctx.get_addr_context(addr)
 
         if self.mode == MODE_DUMP:
-            o = self.ctx.dump_asm(until=dump_until)
+            if dump_until == -1:
+                o = self.ctx.dump_asm()
+            else:
+                ad = self.db.mem.get_head_addr(dump_until)
+                ad += self.db.mem.get_size(ad)
+                o = self.ctx.dump_asm(until=ad)
 
         elif self.mode == MODE_DECOMPILE:
-            self.status_bar("decompiling...", h, True)
+            self.status_bar_message("decompiling...", h, True)
             o = self.ctx.decompile()
 
         if o is not None:
             self.output = o
             self.token_lines = o.token_lines
-            self.last_addr = max(o.addr_line)
+            self.set_last_addr()
             self.first_addr = min(o.addr_line)
             return True
         return False
+
+
+    def status_bar_message(self, s, h, refresh=False):
+        self.screen.move(h, 0)
+        self.screen.clrtoeol()
+        self.screen.addstr(h, 0, s)
+        if refresh:
+            self.screen.refresh()
+
+
+    def redraw(self, h, w):
+        # Redraw first the statusbar
+        if self.has_statusbar:
+            self.screen.move(h, 0)
+            self.screen.clrtoeol()
+
+        line = self.win_y + self.cursor_y
+        if line in self.output.line_addr:
+            ad = self.output.line_addr[line]
+            self.last_curr_line_ad = ad
+        else:
+            ad = self.last_curr_line_ad
+
+        if ad is not None:
+            s = self.dis.binary.get_section(ad)
+            self.screen.addstr(h, 0, s.name, curses.A_BOLD)
+
+            if self.db.mem.is_code(ad):
+                fid = self.db.mem.get_func_id(ad)
+                if fid != -1:
+                    func_ad = self.db.func_id[fid]
+                    name = self.api.get_symbol(func_ad)
+                    if w - len(name) - 1 < 0:
+                        self.screen.insstr(h, 0, name)
+                    else:
+                        self.screen.insstr(h, w - len(name) - 1, name)
+
+        Window.redraw(self, h, w)
 
 
     def main_cmd_rename(self, h, w):
@@ -248,18 +321,22 @@ class Visual(Window):
             line += 1
             moved = True
 
+
         # Goto next line
         if forward and not moved:
             line += 1
             while line not in self.output.line_addr:
                 line += 1
+            ad = self.db.mem.get_head_addr(self.output.line_addr[line])
+            ad += self.db.mem.get_size(ad)
+        else:
+            ad = self.output.line_addr[line]
 
-        ad = self.output.line_addr[line]
 
         s = self.dis.binary.get_section(ad)
 
         if s is None:
-            self.status_bar("not found", h, True)
+            self.status_bar_message("not found", h, True)
             return False
 
         while 1:
@@ -284,14 +361,14 @@ class Visual(Window):
                 else self.dis.binary.get_prev_section(ad)
 
             if s is None:
-                self.status_bar("not found", h, True)
+                self.status_bar_message("not found", h, True)
                 return False
 
             ad = ad = s.start if forward else s.end
 
 
     def main_cmd_search(self, h, w):
-        self.status_bar("/", h, True)
+        self.status_bar_message("/", h, True)
         text = inputbox("", 1, h, w - 1, h)
 
         if not text:
@@ -303,7 +380,7 @@ class Visual(Window):
                 try:
                     textenc.append(int(by, 16))
                 except:
-                    self.status_bar("err search not in hexa", h, True)
+                    self.status_bar_message("err search not in hexa", h, True)
                     return False
             textenc = bytes(textenc)
 
@@ -369,7 +446,7 @@ class Visual(Window):
             text = ""
             is_new_token = True
 
-        self.status_bar("-- INLINE COMMENT --", h)
+        self.status_bar_message("-- INLINE COMMENT --", h)
 
         idx_token = len(tok_line)
         ed = InlineEd(h, w, line, xbegin, idx_token, text,
@@ -404,14 +481,29 @@ class Visual(Window):
         return True
 
 
-    def dump_update_up(self, wy, h):
+    def dump_update_up(self, h, wy):
         if self.mode != MODE_DUMP or wy > 10:
             return wy
 
         if self.first_addr == self.dis.binary.get_first_addr():
             return wy
 
-        ad = self.dis.find_addr_before(self.first_addr)
+        # Get an address 256 bytes before, we can't guess the number of lines
+        # we wan't to disassemble.
+        ad = self.first_addr
+        s = self.dis.binary.get_section(ad)
+        rest = 256
+        while rest:
+            ad -= rest
+            if ad >= s.start:
+                break
+            rest = s.start - ad
+            start = s.start
+            s = self.dis.binary.get_prev_section(start)
+            if s is None:
+                ad = start
+                break
+            ad = s.end + 1
 
         self.ctx = self.gctx.get_addr_context(ad)
         o = self.ctx.dump_asm(until=self.first_addr)
@@ -456,18 +548,14 @@ class Visual(Window):
         return wy
 
 
-    def dump_update_bottom(self, wy, h):
+    def dump_update_bottom(self, h, wy):
         if self.mode != MODE_DUMP or wy < len(self.token_lines) - h - 10:
             return
 
-        if self.last_addr == self.dis.binary.get_last_addr():
+        if self.last_addr - 1 == self.dis.binary.get_last_addr():
             return
 
-        if self.db.mem.is_code(self.last_addr):
-            inst = self.dis.lazy_disasm(self.last_addr)
-            ad = self.last_addr + inst.size
-        else:
-            ad = self.last_addr + 1
+        ad = self.last_addr
 
         self.ctx = self.gctx.get_addr_context(ad)
         o = self.ctx.dump_asm()
@@ -477,7 +565,6 @@ class Visual(Window):
 
             self.output.lines += o.lines
             self.output.token_lines += o.token_lines
-            self.last_addr = max(o.addr_line)
 
             for l in o.line_addr:
                 self.output.line_addr[nb_new_lines + l] = o.line_addr[l]
@@ -485,6 +572,8 @@ class Visual(Window):
                 if l in self.output.idx_tok_inline_comm:
                     self.output.idx_tok_inline_comm[nb_new_lines + l] = \
                             o.idx_tok_inline_comm[l]
+
+            self.set_last_addr()
 
 
     # New mappings
@@ -527,6 +616,7 @@ class Visual(Window):
                 self.exec_disasm(top, h)
 
         Window.k_top(self, h, w)
+        self.last_curr_line_ad = self.first_addr
         return True
 
 
@@ -539,13 +629,14 @@ class Visual(Window):
         if self.mode == MODE_DUMP:
             bottom = self.dis.binary.get_last_addr()
 
-            if self.last_addr != bottom:
+            if self.last_addr - 1 != bottom:
                 self.exec_disasm(bottom, h)
-                self.dump_update_up(self.win_y, h)
+                self.dump_update_up(h, self.win_y)
                 self.win_y = 0
                 self.cursor_y = 0
 
         Window.k_bottom(self, h, w)
+        self.last_curr_line_ad = self.last_addr - 1
         return True
 
 
@@ -720,7 +811,7 @@ class Visual(Window):
             func_id = self.db.mem.get_func_id(ad)
 
             if func_id == -1:
-                self.status_bar("not in a function: create a function or use "
+                self.status_bar_message("not in a function: create a function or use "
                                 "the cmd x in the console", h, True)
                 return False
 
@@ -728,7 +819,7 @@ class Visual(Window):
             self.mode = MODE_DECOMPILE
 
         else:
-            ad_disasm = self.ctx.entry
+            ad_disasm = ad
             self.mode = MODE_DUMP
 
         ret = self.exec_disasm(ad_disasm, h)
@@ -737,13 +828,15 @@ class Visual(Window):
             self.cursor_x = 0
             self.win_y = 0
             self.cursor_y = 0
+            self.win_y = self.dump_update_up(h, self.win_y)
             self.goto_address(ad, h, w)
+            self.main_cmd_line_middle(h, w)
 
         return ret
 
 
     def reload_output(self, h):
-        self.exec_disasm(self.first_addr, h, dump_until=self.last_addr)
+        self.exec_disasm(self.first_addr, h, dump_until=self.last_addr-1)
 
 
     def main_cmd_set_code(self, h, w):
@@ -772,6 +865,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_byte(ad):
+            self.status_bar_message("undefine first", h, True)
             return False
 
         self.reload_output(h)
@@ -786,6 +880,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_word(ad):
+            self.status_bar_message("undefine first", h, True)
             return False
 
         # TODO: add it for 16 bits
@@ -805,6 +900,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_dword(ad):
+            self.status_bar_message("undefine first", h, True)
             return False
 
         # TODO: check architecture first
@@ -822,6 +918,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_qword(ad):
+            self.status_bar_message("undefine first", h, True)
             return False
 
         # TODO: check architecture first
@@ -839,6 +936,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_ascii(ad):
+            self.status_bar_message("undefine first", h, True)
             return False
 
         self.reload_output(h)
@@ -853,9 +951,86 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_offset(ad):
-            self.status_bar("not an address", h, True) 
+            self.status_bar_message("not an address", h, True)
             return False
 
+        self.reload_output(h)
+        self.db.modified = True
+        return True
+
+
+    def main_cmd_undefine(self, h, w):
+        if self.mode == MODE_DECOMPILE:
+            return False
+
+        line = self.win_y + self.cursor_y
+        if line not in self.output.line_addr:
+            return False
+        ad = self.output.line_addr[line]
+        self.api.undefine(ad)
+        self.reload_output(h)
+        self.db.modified = True
+        return True
+
+
+    def main_cmd_set_array(self, h, w):
+        line = self.win_y + self.cursor_y
+        if line not in self.output.line_addr:
+            return False
+        ad = self.output.line_addr[line]
+
+        main_ty = ty = self.db.mem.get_type(ad)
+        if ty == MEM_ARRAY:
+            ty = self.db.mem.get_array_entry_type(ad)
+            sz_entry = self.db.mem.get_size_from_type(ty)
+        else:
+            if ty == -1 or ty == MEM_UNK:
+                ty = MEM_BYTE
+            if ty < MEM_BYTE or ty > MEM_QOFFSET:
+                self.status_bar_message("can't create an array here", h, True)
+                return False
+            sz_entry = self.db.mem.get_size(ad)
+
+        if sz_entry == 1:
+            type_name = "byte"
+        elif sz_entry == 2:
+            type_name = "short"
+        elif sz_entry == 4:
+            type_name = "int"
+        elif sz_entry == 8:
+            type_name = "long"
+
+        if main_ty == MEM_ARRAY:
+            n = int(self.db.mem.get_size(ad) / sz_entry)
+        else:
+            # Try to detect the size
+            n = 1
+            tmp_ad = ad + sz_entry
+            s = self.dis.binary.get_section(tmp_ad)
+            while tmp_ad <= s.end:
+                tmp_ty = self.db.mem.get_type(tmp_ad)
+                if tmp_ty != -1 and tmp_ty != MEM_UNK and \
+                         (tmp_ty < MEM_BYTE or tmp_ty > MEM_QOFFSET):
+                    break
+                if tmp_ad in self.db.xrefs:
+                    break
+
+                tmp_ad += sz_entry
+                n += 1
+
+        word = popup_inputbox("array of %s" % type_name, str(n), h, w)
+
+        if word == "":
+            return True
+
+        try:
+            n = int(word)
+        except:
+            self.redraw(h, w)
+            self.status_bar_message("error: not an integer", h)
+            return False
+
+        self.api.set_array(ad, n, ty)
         self.reload_output(h)
         self.db.modified = True
         return True
@@ -872,7 +1047,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_function(ad):
-            self.status_bar("cannot set a function here", h, True)
+            self.status_bar_message("cannot set a function here", h, True)
             return False
 
         self.reload_output(h)
@@ -882,16 +1057,24 @@ class Visual(Window):
 
 
     def main_cmd_xrefs(self, h, w):
+        num_line = self.win_y + self.cursor_y
+        line = self.output.lines[num_line]
+        if self.cursor_x >= len(line):
+            self.cursor_x = len(line) - 1
+
         word = self.get_word_under_cursor()
         if word is None:
-            return False
+            return None
 
         ctx = self.gctx.get_addr_context(word)
-        if not ctx:
+        if ctx is None:
+            self.status_bar_message("unknown symbol", h, True)
             return False
 
-        if ctx.entry not in self.db.xrefs:
-            self.status_bar("no xrefs", h, True)
+        if not ctx or (ctx.entry not in self.db.xrefs and
+                (ctx.entry not in self.db.mem.data_sub_xrefs or
+                not self.db.mem.data_sub_xrefs[ctx.entry])):
+            self.status_bar_message("no xrefs", h, True)
             return False
 
         o = ctx.dump_xrefs()
@@ -926,6 +1109,8 @@ class Visual(Window):
             self.win_y = 0
             self.saved_stack.clear()
             self.stack.append(topush)
+            self.win_y = self.dump_update_up(h, self.win_y)
+            self.main_cmd_line_middle(h, w)
             self.goto_address(ad, h, w)
         return ret
 
