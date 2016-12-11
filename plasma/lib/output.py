@@ -99,6 +99,11 @@ class OutputAbs():
         self.lines[-1].append(string)
         self.curr_index += len(string)
 
+    def _error(self, string):
+        self.token_lines[-1].append((string, COLOR_ERROR.val, COLOR_ERROR.bold))
+        self.lines[-1].append(string)
+        self.curr_index += len(string)
+
     def _address(self, addr, print_colon=True, normal_color=False, notprefix=False):
         if self.gctx.debugsp:
             from plasma.lib.analyzer import ALL_SP
@@ -283,8 +288,8 @@ class OutputAbs():
                 self._comment("  ")
             if flags & FUNC_FLAG_NORETURN:
                 self._comment(" __noreturn__")
-            if flags & FUNC_FLAG_CDECL:
-                self._comment(" __cdecl__")
+            elif flags & FUNC_FLAG_STDCALL:
+                self._comment(" __stdcall__")
 
         # If it's a label
         if print_colon and ty == MEM_ARRAY:
@@ -310,8 +315,13 @@ class OutputAbs():
             self._new_line()
 
             if self._dis.mem.is_func(ad):
+                if self._dis.functions[ad][FUNC_FLAGS] & \
+                        FUNC_FLAG_ERR_STACK_ANALYSIS:
+                    self._error("stack analysis error")
+                    self._new_line()
+
                 frame_size = self._dis.functions[ad][FUNC_FRAME_SIZE]
-                if frame_size != 0:
+                if frame_size > 0:
                     self._new_line()
                     self._comment("frame_size = %d" % frame_size)
                     self._new_line()
@@ -384,15 +394,21 @@ class OutputAbs():
         if self.gctx.print_bytes:
             i = 0
             for c in by:
+                if i == 0:
+                    self._comment("%.2x" % c)
+                else:
+                    self._comment(" %.2x" % c)
                 i += 1
-                self._comment("%.2x " % c)
                 if i == self.gctx.nbytes:
                     break
 
             if i != self.gctx.nbytes:
                 self._add("   " * (self.gctx.nbytes - i))
 
-            self._add("   ")
+            if self.gctx.nbytes < len(by):
+                self._comment(".  ")
+            else:
+                self._comment("   ")
 
 
     def _comment_fused(self, jump_inst, fused_inst, tab):
@@ -414,7 +430,7 @@ class OutputAbs():
             return
 
         tabs = 0 if self.ctx.is_dump else 1
-        lst = list(self._dis.functions[func_addr][FUNC_OFF_VARS].keys())
+        lst = list(self._dis.functions[func_addr][FUNC_VARS].keys())
 
         if not lst:
             return
@@ -476,9 +492,11 @@ class OutputAbs():
     # print_data  print the string at the address `imm` only if `imm` is not a symbol
     # force_dont_print_data  really don't print data even if it's not a symbol
     #                        it's used for jump/call
+    # is_from_jump   used to print an error if the jump address is unknown (not in
+    #                        the binary)
     #
     def _imm(self, imm, op_size, hexa, section=None, print_data=True,
-             force_dont_print_data=False):
+             force_dont_print_data=False, is_from_jump=False):
 
         if self.gctx.capstone_string != 0:
             hexa = True
@@ -536,7 +554,10 @@ class OutputAbs():
             else:
                 self._string("'%s'" % get_char(imm))
         elif hexa:
-            self._add(hex(imm))
+            if is_from_jump:
+                self._error(hex(imm))
+            else:
+                self._add(hex(imm))
         else:
             if op_size == 4:
                 self._add(str(c_int(imm).value))
@@ -581,14 +602,14 @@ class OutputAbs():
         func_id  = self._dis.mem.get_func_id(i.address)
         if func_id != -1 and func_id in self._dis.func_id:
             func_addr = self._dis.func_id[func_id]
-            tmp = self._dis.functions[func_addr][FUNC_INST_ADDR]
+            tmp = self._dis.functions[func_addr][FUNC_INST_VARS_OFF]
             if i.address in tmp:
                 return func_addr, tmp[i.address]
         return None
 
 
     def get_var_name(self, func_addr, off):
-        name = self._dis.functions[func_addr][FUNC_OFF_VARS][off][VAR_NAME]
+        name = self._dis.functions[func_addr][FUNC_VARS][off][VAR_NAME]
         if name is None:
             if off < 0:
                 return "var_%x" % (-off)
@@ -597,7 +618,7 @@ class OutputAbs():
 
 
     def __get_var_type(self, func_addr, off):
-        ty = self._dis.functions[func_addr][FUNC_OFF_VARS][off][VAR_TYPE]
+        ty = self._dis.functions[func_addr][FUNC_VARS][off][VAR_TYPE]
         if ty == MEM_BYTE:
             t = "char"
         elif ty == MEM_WORD:
@@ -630,8 +651,14 @@ class OutputAbs():
         self._new_line()
 
         if self._dis.mem.is_func(entry):
+            if self._dis.functions[entry][FUNC_FLAGS] & \
+                    FUNC_FLAG_ERR_STACK_ANALYSIS:
+                self._tabs(1)
+                self._error("stack analysis error")
+                self._new_line()
+
             frame_size = self._dis.functions[entry][FUNC_FRAME_SIZE]
-            if frame_size != 0:
+            if frame_size > 0:
                 self._new_line()
                 self._tabs(1)
                 self._comment("frame_size = %d" % frame_size)
@@ -656,7 +683,8 @@ class OutputAbs():
         if self.last_inst_exit_or_ret:
             self._new_line()
 
-        self._previous_comment(i, tab)
+        if self.print_labels:
+            self._previous_comment(i, tab)
 
         if prefix == "# ":
             # debug
@@ -717,7 +745,8 @@ class OutputAbs():
                             self._add(" ")
                             self._comment("# STOPPED")
                     else:
-                        self._operand(i, -1, hexa=True, force_dont_print_data=True)
+                        self._operand(i, -1, hexa=True, force_dont_print_data=True,
+                                      is_from_jump=True)
 
             else:
                 self._sub_asm_inst(i, tab)

@@ -46,19 +46,21 @@ BLOCK_SIZE_MASK = 64-1
 # Index of values for each Database.functions[i]
 FUNC_END = 0
 FUNC_FLAGS = 1
-FUNC_OFF_VARS = 2
+FUNC_VARS = 2
 FUNC_ID = 3
-FUNC_INST_ADDR = 4
+FUNC_INST_VARS_OFF = 4
 FUNC_FRAME_SIZE = 5
+FUNC_ARGS_RESTORE = 6  # for stdcall
 
-# Index of values for each Database.functions[i][FUNC_OFF_VARS][offset]
+# Index of values for each Database.functions[i][FUNC_VARS][offset]
 VAR_TYPE = 0
 VAR_NAME = 1
 
 
 # List of flags, in Database.functions[i][FUNC_FLAGS]
-FUNC_FLAG_NORETURN = 0x1
-FUNC_FLAG_CDECL = 0x2
+FUNC_FLAG_NORETURN = 0b1
+FUNC_FLAG_STDCALL = 0b10
+FUNC_FLAG_ERR_STACK_ANALYSIS = 0b100
 
 
 # Known functions which never returns
@@ -66,12 +68,14 @@ NORETURN_ELF = {
     "exit", "_exit", "__stack_chk_fail", "err", "verr", "errx", "verrx",
     "abort", "__assert_fail", "__libc_start_main", "perror", "__cxa_rethrow",
     "__cxa_throw", "__cxa_call_terminate", "__cxa_bad_cast", "__cxa_call_unexpected",
-    "__cxa_call_unexpected", "__terminate", "__unexpected",
+    "__cxa_call_unexpected", "__terminate", "__unexpected", "_ZSt9terminatev",
+    "_ZSt16__throw_bad_castv",
 }
 
 NORETURN_PE = {
     "exit", "ExitProcess", "_exit", "quick_exit", "_Exit", "abort",
-    "_CxxThrowException", "quick_exit", "RaiseException",
+    "_CxxThrowException", "quick_exit", "RaiseException", "_ExitProcess",
+    "_ZSt9terminatev", "_ZSt16__throw_bad_castv",
 }
 
 
@@ -87,3 +91,7 @@ CAPSTONE_CACHE_SIZE = 60000
 RESERVED_PREFIX = ["loc_", "sub_", "unk_", "byte_", "word_",
                    "dword_", "qword_", "asc_", "off_", "ret_", "loop_",
                    "var_"]
+
+MODE_DUMP = 1
+MODE_DECOMPILE = 2
+MODE_OTHER = 3

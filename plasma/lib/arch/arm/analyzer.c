@@ -28,8 +28,8 @@ typedef char bool;
 #include <capstone/arm.h>
 
 // Same as lib.consts
-#define FUNC_OFF_VARS 2
-#define FUNC_INST_ADDR 4
+#define FUNC_VARS 2
+#define FUNC_INST_VARS_OFF 4
 #define FUNC_FRAME_SIZE 5
 
 
@@ -48,6 +48,7 @@ struct regs_context {
     long *regs;
     bool *is_stack;
     bool *is_def;
+    bool *is_set;
 };
 
 static PyTypeObject regs_context_T = {
@@ -122,8 +123,10 @@ static PyObject *new_regs_context(PyObject *self, PyObject *args)
     r->regs = (long*) malloc(NB_REGS * sizeof(long));
     r->is_stack = (bool*) malloc(NB_REGS * sizeof(bool));
     r->is_def = (bool*) malloc(NB_REGS * sizeof(bool));
+    r->is_set = (bool*) malloc(NB_REGS * sizeof(bool));
 
-    if (r == NULL || r->regs == NULL || r->is_stack == NULL || r->is_def == NULL) {
+    if (r == NULL || r->regs == NULL || r->is_stack == NULL ||
+        r->is_def == NULL || r->is_set == NULL) {
         // fatal error, but don't quit to let the user save the database
         fprintf(stderr, "error: no more memory !!\n");
         Py_RETURN_NONE;
@@ -132,10 +135,12 @@ static PyObject *new_regs_context(PyObject *self, PyObject *args)
     for (i = 0 ; i <= LAST_REG ; i++) {
         r->is_stack[i] = false;
         r->is_def[i] = false;
+        r->is_set[i] = false;
     }
 
     r->regs[ARM_REG_SP] = 0;
     r->is_def[ARM_REG_SP] = true;
+    r->is_set[ARM_REG_SP] = true;
     r->is_stack[ARM_REG_SP] = true;
 
     return (PyObject*) r;
@@ -154,6 +159,7 @@ static PyObject *clone_regs_context(PyObject *self, PyObject *args)
     for (i = 0 ; i <= LAST_REG ; i++) {
         new->regs[i] = regs->regs[i];
         new->is_def[i] = regs->is_def[i];
+        new->is_set[i] = regs->is_set[i];
         new->is_stack[i] = regs->is_stack[i];
     }
 
@@ -165,6 +171,7 @@ static void regs_context_dealloc(PyObject *self)
     struct regs_context *r = (struct regs_context*) self;
     free(r->regs);
     free(r->is_def);
+    free(r->is_set);
     free(r->is_stack);
 }
 
@@ -182,6 +189,11 @@ static inline int is_reg_supported(int r)
 static inline int is_reg_defined(struct regs_context *self, int r)
 {
     return is_reg_supported(r) && self->is_def[r];
+}
+
+static inline int is_reg_setted(struct regs_context *self, int r)
+{
+    return is_reg_supported(r) && self->is_set[r];
 }
 
 static inline void reg_mov(struct regs_context *self, int r, long v)
@@ -362,13 +374,27 @@ static PyObject* reg_value(PyObject *self, PyObject *args)
     struct regs_context *regs;
     int r;
 
-    if (!PyArg_ParseTuple(args, "OB", &regs, &r))
+    if (!PyArg_ParseTuple(args, "Oi", &regs, &r))
         Py_RETURN_NONE;
 
     if (!is_reg_defined(regs, r))
         Py_RETURN_NONE;
 
     return PyLong_FromLong(regs->regs[r]);
+}
+
+static PyObject* reg_is_setted(PyObject *self, PyObject *args)
+{
+    struct regs_context *regs;
+    int r;
+
+    if (!PyArg_ParseTuple(args, "Oi", &regs, &r))
+        Py_RETURN_NONE;
+
+    if (is_reg_setted(regs, r))
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 static PyObject* analyze_operands(PyObject *self, PyObject *args)
@@ -440,7 +466,7 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
 
             // Check if there is a stack reference
             if (is_stack[i] && func_obj != Py_None &&
-                PyLong_AsLong(PyList_GET_ITEM(func_obj, FUNC_FRAME_SIZE)) != -1) {
+                -values[i] <= PyLong_AsLong(PyList_GET_ITEM(func_obj, FUNC_FRAME_SIZE))) {
 
                 // ty = analyzer.db.mem.get_type_from_size(op_size)
                 db = PyObject_GetAttrString(analyzer, "db");
@@ -449,8 +475,8 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
                                          get_op_mem_size(id));
 
                 // The second item is the name of the variable
-                // func_obj[FUNC_OFF_VARS][v] = [ty, None]
-                tmp = PyList_GET_ITEM(func_obj, FUNC_OFF_VARS);
+                // func_obj[FUNC_VARS][v] = [ty, None]
+                tmp = PyList_GET_ITEM(func_obj, FUNC_VARS);
                 Py_INCREF(tmp);
                 PyObject *l = PyList_New(2);
                 PyList_SET_ITEM(l, 0, ty);
@@ -458,8 +484,8 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
                 PyDict_SetItem(tmp, PyLong_FromLong((int) values[i]), l);
                 Py_DECREF(tmp);
 
-                // func_obj[FUNC_INST_ADDR][i.address] = v
-                tmp = PyList_GET_ITEM(func_obj, FUNC_INST_ADDR);
+                // func_obj[FUNC_INST_VARS_OFF][i.address] = v
+                tmp = PyList_GET_ITEM(func_obj, FUNC_INST_VARS_OFF);
                 Py_INCREF(tmp);
                 PyDict_SetItem(tmp, PyObject_GetAttrString(insn, "address"),
                                PyLong_FromLong((int) values[i]));
@@ -482,6 +508,8 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
 
     if (len_ops == 2) {
         if (id == ARM_INS_MOV || id == ARM_INS_MVN) {
+            if (only_simulate)
+                regs->is_set[r1] = true;
             if (!err[1]) {
                 if (id == ARM_INS_MVN)
                     values[1] = ~values[1];
@@ -508,17 +536,22 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
 
     regs->is_stack[r1] = is_stack[1] | is_stack[2];
 
+    // TODO : globally is_set = true
+
     switch (id) {
         case ARM_INS_ADD:
             reg_add(regs, r1, values[1], values[2]);
+            regs->is_set[r1] = true;
             break;
 
         case ARM_INS_SUB:
             reg_sub(regs, r1, values[1], values[2]);
+            regs->is_set[r1] = true;
             break;
 
         case ARM_INS_AND:
             reg_and(regs, r1, values[1], values[2]);
+            regs->is_set[r1] = true;
             break;
 
         default:
@@ -555,6 +588,7 @@ static PyMethodDef mod_methods[] = {
     { "clone_regs_context", clone_regs_context, METH_VARARGS },
     { "analyze_operands", analyze_operands, METH_VARARGS },
     { "reg_value", reg_value, METH_VARARGS },
+    { "reg_is_setted", reg_is_setted, METH_VARARGS },
     { "get_sp", get_sp, METH_VARARGS },
     { "set_sp", set_sp, METH_VARARGS },
     { "set_wordsize", set_wordsize, METH_VARARGS },

@@ -74,43 +74,6 @@ class Analyzer(threading.Thread):
         return None
 
 
-    def import_flags(self, ad):
-        # Check all known functions which never return
-        if ad not in self.dis.binary.imports:
-            return 0
-        name = self.db.reverse_symbols[ad]
-        if self.dis.binary.type == T_BIN_PE:
-            return FUNC_FLAG_NORETURN if name in NORETURN_PE else 0
-        elif self.dis.binary.type == T_BIN_ELF:
-            return FUNC_FLAG_NORETURN if name in NORETURN_ELF else 0
-        return 0
-
-
-    #
-    # Cdecl calling convention recall :
-    # Note: stack offsets are negatives !
-    #
-    # push rax
-    # push rbx          ----> sp_after_push = -frame_size - 8*2
-    # call func
-    # ...
-    #
-    # rsp is reset to -frame_size (see in __sub_analyze_flow before the
-    # is_call). This is for working correclty with stdcall.
-    # But for cdecl, the rsp is restored with an add :
-    #
-    # add rsp, 16       ----> curr_sp = -frame_size + 16
-    #
-    # FIXME: if we have for example multiple "add rsp" to give the same
-    # result as add rsp, 16
-    #
-    def handle_cdecl(self, frame_size, sp_after_push, curr_sp):
-        # It means there was an add instruction so we restore curr_sp to
-        # sp_after_push with the current difference.
-        return -curr_sp < frame_size and \
-            frame_size - -curr_sp == -sp_after_push - frame_size
-
-
     def run(self):
         while 1:
             item = self.msg.get()
@@ -246,7 +209,7 @@ class Analyzer(threading.Thread):
                         # and should be check first.
                         if not self.db.mem.exists(val) and \
                                 not self.db.mem.is_overlapping(val):
-                            self.db.mem.add(val, self.dis.wordsize, MEM_UNK)
+                            self.db.mem.add(val, 1, MEM_UNK)
                             # Do an analysis on this value.
                             if s.is_exec and self.first_inst_are_code(val):
                                 self.analyze_flow(
@@ -305,14 +268,14 @@ class Analyzer(threading.Thread):
 
 
     # Do an analysis if the immediate is an address
-    def analyze_imm(self, i, op, imm, is_register):
+    # If from_save_imm is true, op is the destination where we save imm
+    # -> inst op, computed_imm
+    def analyze_imm(self, i, op, imm, from_save_imm):
         if imm <= 1024:
             return False
 
-        if not is_register and op.type != self.ARCH_UTILS.OP_MEM and \
-                op.type != self.ARCH_UTILS.OP_IMM:
+        if not from_save_imm and op.type == self.ARCH_UTILS.OP_REG:
             return False
-
 
         # imm must be an address
         s = self.dis.binary.get_section(imm)
@@ -349,6 +312,7 @@ class Analyzer(threading.Thread):
             ty = self.db.mem.get_type_from_size(sz)
         else:
             ty = MEM_UNK
+            sz = 1
 
         self.db.mem.add(ad, sz, ty)
 
@@ -417,11 +381,10 @@ class Analyzer(threading.Thread):
 
 
     def __add_analyzed_code(self, func_obj, mem, entry, inner_code,
-                            entry_is_func, flags):
+                            entry_is_func):
         if func_obj is not None:
             e = max(inner_code) if inner_code else -1
             func_id = func_obj[FUNC_ID]
-            func_obj[FUNC_FLAGS] = flags
             func_obj[FUNC_END] = e
             self.functions[entry] = func_obj
             self.db.func_id[func_id] = entry
@@ -533,18 +496,6 @@ class Analyzer(threading.Thread):
 
         is_pe_import = False
 
-        # Check if it's a jump to an imported symbol : jmp *(IMPORT)
-        if self.dis.binary.type == T_BIN_PE:
-            if entry in self.dis.binary.imports:
-                is_pe_import = True
-                flags = self.import_flags(entry)
-            else:
-                inst = self.dis.lazy_disasm(entry)
-                if inst is not None:
-                    ptr = self.dis.binary.reverse_stripped(self.dis, inst)
-                    if ptr != -1:
-                        inner_code[inst.address] = inst
-                        flags = self.import_flags(ptr)
 
         # Create a function object (see in Database)
 
@@ -552,33 +503,48 @@ class Analyzer(threading.Thread):
             # It can be None because when symbols are loaded functions are
             # set to None initially.
             if is_def and self.functions[entry] is not None:
-                last_end = self.functions[entry][FUNC_END]
+                func_obj = self.functions[entry]
+                last_end = func_obj[FUNC_END]
                 self.db.end_functions[last_end].remove(entry)
                 if not self.db.end_functions[last_end]:
                     del self.db.end_functions[last_end]
+                func_obj[FUNC_VARS].clear()
+                func_obj[FUNC_INST_VARS_OFF].clear()
+            else:
+                # [func_end,
+                #  flags,
+                #  var_offsets,
+                #  func_id,
+                #  inst.addresses,
+                #  stack_offset,
+                #  frame_size,
+                #  args_restore]
+                func_obj = [-1, 0, {}, self.db.func_id_counter, {}, -1, 0]
+                self.db.func_id_counter += 1
 
-            # [func_end,
-            #  flags,
-            #  var_offsets,
-            #  func_id,
-            #  inst.addresses,
-            #  stack_offset,
-            #  frame_size]
-            func_obj = [-1, 0, {}, self.db.func_id_counter, {}, 0, -1]
-            self.db.func_id_counter += 1
+            # Check if it's a jump to an imported symbol : jmp|call *(IMPORT)
+            if self.dis.binary.type == T_BIN_PE:
+                if entry in self.dis.binary.imports:
+                    is_pe_import = True
+                    func_obj[FUNC_FLAGS] = self.dis.import_flags(entry)
+                else:
+                    inst = self.dis.lazy_disasm(entry)
+                    if inst is not None:
+                        ptr = self.dis.binary.reverse_stripped(self.dis, inst)
+                        if ptr != -1:
+                            inner_code[inst.address] = inst
+                            func_obj[FUNC_FLAGS] = self.dis.import_flags(ptr)
         else:
             func_obj = None
 
         do_save = True
 
         if not is_pe_import and not inner_code:
-            flags = self.__sub_analyze_flow(func_obj, entry, inner_code, add_if_code)
-            if flags == -1:
-                do_save = False
+            do_save = self.__sub_analyze_flow(func_obj, entry, inner_code, add_if_code)
 
         if inner_code and do_save:
             self.__add_analyzed_code(func_obj, self.db.mem, entry, inner_code,
-                                     entry_is_func, flags)
+                                     entry_is_func)
 
         inner_code.clear()
         self.pending.remove(entry)
@@ -595,17 +561,21 @@ class Analyzer(threading.Thread):
         regsctx = self.arch_analyzer.new_regs_context()
         if regsctx is None:
             # fatal error, but don't quit to let the user save the database
-            return -1
+            return False
 
+        flags = 0
+        stack_err = False
+        args_restore = 0
         if func_obj is not None:
-            frame_size = self.ARCH_UTILS.guess_frame_size(self, entry)
-            func_obj[FUNC_FRAME_SIZE] = frame_size
+            frame_size = func_obj[FUNC_FRAME_SIZE]
+            if frame_size == -1:
+                frame_size = self.ARCH_UTILS.guess_frame_size(self, entry)
+                # used in arch/*/analyzer.c
+                func_obj[FUNC_FRAME_SIZE] = frame_size
         else:
             frame_size = -1
 
-        sp_after_push = 0
-        last_call = None
-        has_ret = False
+        ret_found = False
         stack = [(regsctx, entry)]
 
         while stack:
@@ -629,7 +599,14 @@ class Analyzer(threading.Thread):
             ##### RETURN #####
             if self.is_ret(inst):
                 self.__add_prefetch(inner_code, inst)
-                has_ret = True
+                ret_found = True
+
+                if self.dis.is_x86 and len(inst.operands) == 1:
+                    args_restore = inst.operands[0].value.imm
+                    flags |= FUNC_FLAG_STDCALL
+
+                if self.arch_analyzer.get_sp(regsctx) != 0:
+                    flags |= FUNC_FLAG_ERR_STACK_ANALYSIS
 
             ##### UNCONDITIONAL JUMP #####
             elif self.is_uncond_jump(inst):
@@ -669,17 +646,20 @@ class Analyzer(threading.Thread):
                             self, regsctx, inst, func_obj, False)
                     # TODO: assume it has a return
                     if jmp_ad is None:
-                        has_ret = True
+                        ret_found = self.dis.import_flags(entry) == 0
                         continue
 
                 self.api.add_xref(ad, jmp_ad)
                 if self.db.mem.is_func(jmp_ad):
-                    has_ret = not self.is_noreturn(jmp_ad, entry)
+                    ret_found = not self.is_noreturn(jmp_ad, entry)
+                    fo = self.functions[jmp_ad]
+                    flags = fo[FUNC_FLAGS]
+                    frame_size = max(fo[FUNC_FRAME_SIZE], frame_size)
+                    args_restore = fo[FUNC_ARGS_RESTORE]
                 else:
                     stack.append((regsctx, jmp_ad))
                 if add_if_code:
                     added_xrefs.append((ad, jmp_ad))
-
 
             ##### CONDITIONAL JUMP #####
             elif self.is_cond_jump(inst):
@@ -696,7 +676,11 @@ class Analyzer(threading.Thread):
                     self.api.add_xref(ad, nxt_jmp)
 
                     if self.db.mem.is_func(direct_nxt):
-                        has_ret = not self.is_noreturn(direct_nxt, entry)
+                        ret_found = not self.is_noreturn(direct_nxt, entry)
+                        fo = self.functions[direct_nxt]
+                        flags = fo[FUNC_FLAGS]
+                        frame_size = max(fo[FUNC_FRAME_SIZE], frame_size)
+                        args_restore = fo[FUNC_ARGS_RESTORE]
                     else:
                         stack.append((regsctx, direct_nxt))
 
@@ -704,7 +688,7 @@ class Analyzer(threading.Thread):
                         added_xrefs.append((ad, nxt_jmp))
 
                     if self.db.mem.is_func(nxt_jmp):
-                        has_ret = not self.is_noreturn(nxt_jmp, entry)
+                        ret_found = not self.is_noreturn(nxt_jmp, entry)
                     else:
                         newctx = self.arch_analyzer.clone_regs_context(regsctx)
                         stack.append((newctx, nxt_jmp))
@@ -717,6 +701,7 @@ class Analyzer(threading.Thread):
             elif self.is_call(inst):
                 op = inst.operands[-1]
                 call_ad = None
+                sp_before = self.arch_analyzer.get_sp(regsctx)
 
                 if op.type == self.ARCH_UTILS.OP_IMM:
                     call_ad = unsigned(op.value.imm)
@@ -729,9 +714,11 @@ class Analyzer(threading.Thread):
                 else:
                     self.arch_analyzer.analyze_operands(
                             self, regsctx, inst, func_obj, False)
+                    if self.dis.import_flags(op.mem.disp) == FUNC_FLAG_NORETURN:
+                        self.__add_prefetch(inner_code, inst)
+                        continue
 
                 if call_ad is not None:
-                    last_call = call_ad
                     self.api.add_xref(ad, call_ad)
 
                     if add_if_code:
@@ -743,11 +730,15 @@ class Analyzer(threading.Thread):
                             force=False,
                             add_if_code=add_if_code)
 
+                    # TODO: if the address was alredy in the pending list
+                    # we don't have a computed args size
                     # Reset the stack pointer to frame_size to handle stdcall.
-                    if frame_size != -1:
-                        sp_after_push = self.arch_analyzer.get_sp(regsctx)
-                        if frame_size != - sp_after_push:
-                            self.arch_analyzer.set_sp(regsctx, -frame_size)
+                    if frame_size != -1 and call_ad in self.functions:
+                        fo = self.functions[call_ad]
+                        if fo is not None:
+                            n = fo[FUNC_ARGS_RESTORE]
+                            if n:
+                                self.arch_analyzer.set_sp(regsctx, sp_before + n)
 
                     if self.db.mem.is_func(call_ad):
                         if self.is_noreturn(call_ad, entry):
@@ -759,33 +750,8 @@ class Analyzer(threading.Thread):
 
             ##### OTHERS #####
             else:
-                if frame_size != -1:
-                    sp_before = self.arch_analyzer.get_sp(regsctx)
-
                 self.arch_analyzer.analyze_operands(
                         self, regsctx, inst, func_obj, False)
-
-                # FIXME: reload after the previous call to handle correctly
-                # the cdecl.
-
-                # See also FIXME in handle_cdecl
-
-                # Restore the stack pointer to sp_after_push to handle cdecl.
-                if frame_size != -1:
-                    curr_sp = self.arch_analyzer.get_sp(regsctx)
-                    if curr_sp != sp_before and \
-                            self.handle_cdecl(frame_size, sp_after_push, curr_sp):
-
-                        new_sp = sp_after_push - (sp_before - curr_sp)
-                        self.arch_analyzer.set_sp(regsctx, new_sp)
-
-                        if last_call is not None and self.db.mem.is_func(last_call):
-                            self.functions[last_call][FUNC_FLAGS] |= FUNC_FLAG_CDECL
-
-                        if self.gctx.debugsp:
-                            ALL_SP[ad] = sp_after_push
-
-                        sp_after_push = 0
 
                 nxt = inst.address + inst.size
                 if nxt not in self.functions:
@@ -798,11 +764,15 @@ class Analyzer(threading.Thread):
                     self.api.rm_xrefs_table(from_ad, to_ad)
                 else:
                     self.api.rm_xref(from_ad, to_ad)
-            return -1
+            return False
 
-        # Set function flags
-        flags = self.import_flags(entry)
-        if flags == 0 and not has_ret:
-            flags = FUNC_FLAG_NORETURN
+        if func_obj is not None:
+            ret = self.dis.import_flags(entry)
+            if ret == FUNC_FLAG_NORETURN or not ret_found:
+                flags |= FUNC_FLAG_NORETURN
 
-        return flags
+            func_obj[FUNC_FLAGS] = flags
+            func_obj[FUNC_FRAME_SIZE] = frame_size
+            func_obj[FUNC_ARGS_RESTORE] = args_restore
+
+        return True

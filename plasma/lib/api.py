@@ -40,6 +40,8 @@ class Api():
         self.__db = gctx.db
         self.mem = gctx.db.mem
         self.__queue_wait = Queue()
+        self.arch = gctx.dis.binary.arch
+        self.is_big_endian = gctx.dis.binary.is_big_endian()
 
 
     def entry_point(self):
@@ -289,7 +291,7 @@ class Api():
         if ad + sz > s.end + 1:
             return False
 
-        if MEM_QOFFSET <= entry_type <= MEM_QOFFSET:
+        if MEM_WOFFSET <= entry_type <= MEM_QOFFSET:
             end = ad + sz
             i = ad
             while i < end:
@@ -460,8 +462,8 @@ class Api():
 
     def add_symbol(self, ad, name, force=False):
         """
-        Match the symbol name to ad. If ad has already a symbol
-        or if name is already defined, it's erased first.
+        Match the symbol name to ad. If ad has already a symbol, it's
+        renamed. If name exists, a suffix '_counter' is added.
 
         force could be set to True if the name starts with a
         reserved prefix (sub_, loc_, ret_, loop_, ...). Use it if
@@ -473,8 +475,12 @@ class Api():
             return False
 
         if name in self.__db.symbols:
-            last = self.__db.symbols[name]
-            del self.__db.reverse_symbols[last]
+            i = 0
+            while 1:
+                name = "%s_%d" % (name, i)
+                i += 1
+                if name not in self.__db.symbols:
+                    break
 
         if ad in self.__db.reverse_symbols:
             last = self.__db.reverse_symbols[ad]
@@ -572,10 +578,11 @@ class Api():
             self.__db.xrefs[to_ad] = [from_ad]
 
         head = self.mem.get_head_addr(to_ad)
-        if head != to_ad and head in self.__db.data_sub_xrefs:
+        if head in self.__db.data_sub_xrefs:
             self.__db.data_sub_xrefs[head][to_ad] = True
-            end = head + self.mem.get_size(head)
-            self.mem.mm[to_ad] = [end - to_ad, MEM_HEAD, head]
+            if head != to_ad:
+                end = head + self.mem.get_size(head)
+                self.mem.mm[to_ad] = [end - to_ad, MEM_HEAD, head]
 
 
     def add_xrefs_table(self, from_ad, to_ad_list):
@@ -591,7 +598,7 @@ class Api():
                 del self.__db.xrefs[to_ad]
 
         head = self.mem.get_head_addr(to_ad)
-        if head != to_ad and head in self.__db.data_sub_xrefs:
+        if head in self.__db.data_sub_xrefs:
             del self.__db.data_sub_xrefs[head][to_ad]
 
 
@@ -705,30 +712,27 @@ class Api():
         return self.__db.func_id[func_id]
 
 
-    def insert_struct(self, name, s):
+    def set_frame_size(self, func_ad, frame_size):
         """
-        Create a structure. It returns the struct id or -1 if an error occurs.
-
-        attrs is a list to define each attribute, example :
-        [
-            ["attr1", MEM_POINTER(MEM_BYTE)],
-            ["attr2", MEM_DWORD],
-            ["attr3", MEM_ARRAY, nb_entries],
-        ]
+        Set a new frame size for the function at address `func_ad'.
+        frame_size must be >= 0
         """
-        if name in self.__db.structs_name2id:
-            return -1
-
-        id = self.__db.struct_id_counter
-        self.__db.struct_id_counter += 1
-
-        self.__db.structure[id] = s
-        self.__db.structs_name2id[name] = id
-        return id
+        if frame_size < 0 or func_ad not in self.__db.functions:
+            return False
+        self.__db.functions[func_ad][FUNC_FRAME_SIZE] = frame_size
+        self.__analyzer.msg.put((func_ad, True, True, False, self.__queue_wait))
+        self.__queue_wait.get()
+        return True
 
 
-    def get_struct_id(self, name):
+    def set_noreturn(self, func_ad, val):
         """
-        Returns the id or -1 if name is unknown.
+        val is a boolean. It sets the function as noreturn or not
+        TODO: reload the analyzer
         """
-        return self.__db.structs_name2id.get(name, -1)
+        if func_ad not in self.__db.functions:
+            return False
+        if val:
+            self.__db.functions[func_ad][FUNC_FLAGS] |= FUNC_FLAG_NORETURN
+        else:
+            self.__db.functions[func_ad][FUNC_FLAGS] &= ~FUNC_FLAG_NORETURN

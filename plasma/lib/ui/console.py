@@ -59,6 +59,7 @@ COMMANDS_ALPHA = [
     "analyzer",
     "dump",
     "exit",
+    "frame_size",
     "functions",
     "help",
     "hexdump",
@@ -84,8 +85,9 @@ def yellow(text):
 
 
 class Command():
-    def __init__(self, max_args, callback_exec, callback_complete, desc):
+    def __init__(self, max_args, min_args, callback_exec, callback_complete, desc):
         self.max_args = max_args
+        self.min_args = min_args
         self.callback_complete = callback_complete
         self.callback_exec = callback_exec
         self.desc = desc
@@ -187,9 +189,10 @@ class Console():
 
         # After exiting the visual mode we copy last addresses we have visited.
         # Then we can just enter 'v' and we go where we were.
-        self.last_entry = None
-        self.last_stack = []
-        self.last_saved_stack = []
+        self.visual_last_entry = None
+        self.visual_last_stack = []
+        self.visual_last_saved_stack = []
+        self.visual_last_mode = MODE_DUMP
 
         # A hack to allow window resizing
         os.environ['LINES']="blah"
@@ -199,7 +202,7 @@ class Console():
 
         self.COMMANDS = {
             "analyzer": Command(
-                0,
+                0, 0,
                 self.__exec_analyzer,
                 None,
                 [
@@ -209,7 +212,7 @@ class Console():
             ),
 
             "push_analyze_symbols": Command(
-                0,
+                0, 0,
                 self.push_analyze_symbols,
                 None,
                 [
@@ -219,7 +222,7 @@ class Console():
             ),
 
             "help": Command(
-                0,
+                0, 0,
                 self.__exec_help,
                 None,
                 [
@@ -229,7 +232,7 @@ class Console():
             ),
 
             "history": Command(
-                0,
+                0, 0,
                 self.__exec_history,
                 None,
                 [
@@ -239,7 +242,7 @@ class Console():
             ),
 
             "save": Command(
-                0,
+                0, 0,
                 self.__exec_save,
                 None,
                 [
@@ -249,7 +252,7 @@ class Console():
             ),
 
             "x": Command(
-                1,
+                1, 0,
                 self.__exec_x,
                 self.__complete_x,
                 [
@@ -261,7 +264,7 @@ class Console():
             ),
 
             "v": Command(
-                1,
+                1, 0,
                 self.__exec_v,
                 self.__complete_x,
                 [
@@ -306,7 +309,7 @@ class Console():
             ),
 
             "hexdump": Command(
-                2,
+                2, 1,
                 self.__exec_hexdump,
                 self.__complete_x,
                 [
@@ -317,7 +320,7 @@ class Console():
 
             # by default it will be gctx.nb_lines
             "dump": Command(
-                2,
+                2, 1,
                 self.__exec_dump,
                 self.__complete_x,
                 [
@@ -327,7 +330,7 @@ class Console():
             ),
 
             "sym": Command(
-                3,
+                3, 0,
                 self.__exec_sym,
                 self.__complete_x,
                 [
@@ -339,7 +342,7 @@ class Console():
             ),
 
             "rename": Command(
-                2,
+                2, 2,
                 self.__exec_rename,
                 self.__complete_x,
                 [
@@ -349,7 +352,7 @@ class Console():
             ),
 
             "exit": Command(
-                0,
+                0, 0,
                 self.__exec_exit,
                 None,
                 [
@@ -359,7 +362,7 @@ class Console():
             ),
 
             "sections": Command(
-                0,
+                0, 0,
                 self.__exec_sections,
                 None,
                 [
@@ -369,7 +372,7 @@ class Console():
             ),
 
             "info": Command(
-                0,
+                0, 0,
                 self.__exec_info,
                 None,
                 [
@@ -379,7 +382,7 @@ class Console():
             ),
 
             "jmptable": Command(
-                4,
+                4, 4,
                 self.__exec_jmptable,
                 None,
                 [
@@ -390,7 +393,7 @@ class Console():
             ),
 
             "py": Command(
-                -1,
+                -1, 0,
                 self.__exec_py,
                 self.__complete_file,
                 [
@@ -402,7 +405,7 @@ class Console():
             ),
 
             "mips_set_gp": Command(
-                1,
+                1, 1,
                 self.__exec_mips_set_gp,
                 None,
                 [
@@ -413,7 +416,7 @@ class Console():
             ),
 
             "functions": Command(
-                1,
+                0, 0,
                 self.__exec_functions,
                 None,
                 [
@@ -423,7 +426,7 @@ class Console():
             ),
 
             "xrefs": Command(
-                1,
+                1, 1,
                 self.__exec_xrefs,
                 self.__complete_x,
                 [
@@ -433,7 +436,7 @@ class Console():
             ),
 
             "memmap": Command(
-                0,
+                0, 0,
                 self.__exec_memmap,
                 None,
                 [
@@ -441,6 +444,17 @@ class Console():
                 "Open a qt window to display the memory."
                 ]
             ),
+
+            "frame_size": Command(
+                2, 2,
+                self.__exec_frame_size,
+                self.__complete_x,
+                [
+                "[SYMBOL|0xXXXX|EP] frame_size",
+                "Change the frame size of a function, the function will be re-analyzed."
+                ]
+            ),
+
         }
 
         if gctx.dis.is_x86:
@@ -467,10 +481,6 @@ class Console():
             # If false it means that the first analysis was already done
             if gctx.autoanalyzer and len(self.db.mem) == 0:
                 self.push_analyze_symbols(None)
-
-        print("new feature: an instruction preceded by ! means that the analyzer", file=sys.stderr)
-        print("has computed an immediate value. In the visual mode, use the shortcut", file=sys.stderr)
-        print("I to show original instructions.", file=sys.stderr)
 
         self.comp = Completer(self)
         self.comp.set_history(self.db.history)
@@ -569,7 +579,11 @@ class Console():
 
 
     def exec_command(self, line):
-        args = shlex.split(line)
+        try:
+            args = shlex.split(line)
+        except Exception as e:
+            print("error:", e)
+            return
         if not args:
             return
         if args[0] not in self.COMMANDS:
@@ -579,6 +593,10 @@ class Console():
 
         if c.max_args != -1 and len(args) - 1 > c.max_args:
             error("%s takes max %d args" % (args[0], c.max_args))
+            return
+
+        if len(args) - 1 < c.min_args:
+            error("%s takes at least %d args" % (args[0], c.min_args))
             return
 
         if c.callback_exec is not None:
@@ -609,10 +627,6 @@ class Console():
 
     def __exec_hexdump(self, args):
         nb_lines = self.gctx.nb_lines
-        if len(args) <= 1:
-            self.gctx.entry = None
-            error("no address in parameter")
-            return
 
         if len(args) == 3:
             try:
@@ -670,10 +684,6 @@ class Console():
             self.gctx.dis.print_symbols(args[2])
             return
 
-        if len(args) > 3:
-            error("bad arguments")
-            return
-
         if len(args) == 2:
             error("an address is required to save the symbol")
             return
@@ -711,16 +721,14 @@ class Console():
     def __exec_v(self, args):
         if len(args) != 1:
             ad = args[1]
+            self.visual_last_mode = MODE_DUMP
         else:
-            ad = self.last_entry
-        ctx = self.gctx.get_addr_context(ad)
-        if ctx:
-            o = ctx.dump_asm(NB_LINES_TO_DISASM)
-            if o is not None:
-                v = Visual(self.gctx, ctx, self.analyzer, self.api,
-                       self.last_stack, self.last_saved_stack)
-                if v.last_curr_line_ad is not None:
-                    self.last_entry = v.last_curr_line_ad
+            ad = self.visual_last_entry
+        v = Visual(self.gctx, ad, self.analyzer, self.api,
+               self.visual_last_stack, self.visual_last_saved_stack,
+               self.visual_last_mode)
+        if v.last_curr_line_ad is not None:
+            self.visual_last_entry = v.last_curr_line_ad
 
 
     def __exec_help(self, args):
@@ -810,15 +818,12 @@ class Console():
 
 
     def __exec_mips_set_gp(self, args):
-        try:
-            self.gctx.dis.mips_gp = int(args[1], 16)
-            self.db.mips_gp = self.gctx.dis.mips_gp
-            self.db.mem.mm.clear()
-            self.db.xrefs.clear()
-            self.db.data_sub_xrefs.clear()
-            self.db.immediates.clear()
-        except:
-            error("bad address")
+        self.gctx.dis.mips_gp = int(args[1], 16)
+        self.db.mips_gp = self.gctx.dis.mips_gp
+        self.db.mem.mm.clear()
+        self.db.xrefs.clear()
+        self.db.data_sub_xrefs.clear()
+        self.db.immediates.clear()
         self.db.modified = True
 
 
@@ -849,3 +854,10 @@ class Console():
         from plasma.lib.memmap import ThreadMemoryMap
         t = ThreadMemoryMap(self.db, self.gctx.dis.binary)
         t.start()
+
+
+    def __exec_frame_size(self, args):
+        ctx = self.gctx.get_addr_context(args[1])
+        frame_size = int(args[2])
+        if ctx:
+            self.api.set_frame_size(ctx.entry, frame_size)

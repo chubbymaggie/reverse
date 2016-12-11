@@ -19,6 +19,7 @@
 
 import curses
 import traceback
+import binascii
 
 from plasma.lib.utils import error, die
 from plasma.lib.custom_colors import *
@@ -28,25 +29,59 @@ from plasma.lib.consts import *
 
 
 class Visual(Window):
-    def __init__(self, gctx, ctx, analyzer, api, stack, saved_stack):
-        Window.__init__(self, ctx.output, has_statusbar=True)
+    def __init__(self, gctx, ad, analyzer, api, stack, saved_stack,
+                 mode=MODE_DUMP):
 
-        self.ctx = ctx
         self.gctx = gctx
-        self.mode = MODE_DUMP
         self.dis = gctx.dis
         self.db = gctx.db
         self.analyzer = analyzer
         self.api = api
+        self.last_curr_line_ad = None
+
+        # Disassemble
+
+        self.ctx = self.gctx.get_addr_context(ad)
+        if not self.ctx:
+            return
+
+        ad = self.ctx.entry
+        ad_disasm = ad
+
+        if mode == MODE_DECOMPILE:
+            if self.db.mem.is_code(ad_disasm):
+                fid = self.db.mem.get_func_id(ad_disasm)
+                if fid != -1:
+                    self.ctx.entry = self.db.func_id[fid]
+                else:
+                    mode = MODE_DUMP
+            else:
+                mode = MODE_DUMP
+
+        if mode == MODE_DUMP:
+            self.ctx.output = self.ctx.dump_asm()
+        else:
+            self.ctx.output = self.ctx.decompile()
+
+
+        # Some init...
+
+        Window.__init__(self, self.ctx.output, has_statusbar=True)
+        self.mode = mode
 
         # Last/first address printed (only in MODE_DUMP)
         self.set_last_addr()
-        self.first_addr = min(self.output.addr_line)
-
-        self.last_curr_line_ad = None
+        self.set_first_addr()
 
         self.stack = stack
         self.saved_stack = saved_stack # when we enter, go back, then re-enter
+
+        saved_quiet = self.gctx.quiet
+        self.gctx.quiet = True
+
+        # Note: all these functions should return a boolean. The value is true
+        # if the screen must be refreshed (not re-drawn, in this case call
+        # explictly self.redraw or self.reload_output if the output changed).
 
         new_mapping = {
             b"z": self.main_cmd_line_middle,
@@ -76,6 +111,7 @@ class Visual(Window):
             b"o": self.main_cmd_set_offset,
             b"*": self.main_cmd_set_array,
             b"U": self.main_cmd_undefine,
+            b"S": self.main_cmd_set_frame_size,
 
             b"\n": self.main_cmd_enter,
             b"\x1b": self.main_cmd_escape,
@@ -85,11 +121,10 @@ class Visual(Window):
 
         self.mapping.update(new_mapping)
 
-        saved_quiet = self.gctx.quiet
-        self.gctx.quiet = True
+
+        # Start curses
 
         self.screen = curses.initscr()
-
         curses.noecho()
         curses.cbreak()
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
@@ -120,8 +155,9 @@ class Visual(Window):
         # Init some y coordinate, used to compute the cursor position
         self.init_section_coords()
 
+
         self.win_y = self.dump_update_up(h, self.win_y)
-        self.goto_address(ctx.entry, h, w)
+        self.goto_address(ad, h, w)
         self.main_cmd_line_middle(h, w)
 
         try:
@@ -165,8 +201,18 @@ class Visual(Window):
         self.last_addr = ad
 
 
+    def set_first_addr(self):
+        if self.mode == MODE_DUMP:
+            self.first_addr = min(self.output.addr_line)
+        else:
+            self.first_addr = self.ctx.entry
+
+
     def exec_disasm(self, addr, h, dump_until=-1):
         self.ctx = self.gctx.get_addr_context(addr)
+
+        if self.ctx is None:
+            return False
 
         if self.mode == MODE_DUMP:
             if dump_until == -1:
@@ -184,7 +230,7 @@ class Visual(Window):
             self.output = o
             self.token_lines = o.token_lines
             self.set_last_addr()
-            self.first_addr = min(o.addr_line)
+            self.set_first_addr()
             return True
         return False
 
@@ -275,7 +321,12 @@ class Visual(Window):
 
         text = popup_inputbox("rename", word, h, w).replace(" ", "_")
 
-        if word == text or not text or self.api.is_reserved_prefix(text):
+        if self.api.is_reserved_prefix(text):
+            self.redraw(h, w)
+            self.status_bar_message("error: reserved prefix", h)
+            return False
+
+        if word == text or not text:
             return True
 
         if is_var:
@@ -375,15 +426,11 @@ class Visual(Window):
             return True
 
         if text[0] == "!":
-            textenc = []
-            for by in text[1:].split():
-                try:
-                    textenc.append(int(by, 16))
-                except:
-                    self.status_bar_message("err search not in hexa", h, True)
-                    return False
-            textenc = bytes(textenc)
-
+            try:
+                textenc = binascii.unhexlify(text[1:].replace(" ", ""))
+            except:
+                self.status_bar_message("error: search not in hexa", h, True)
+                return False
         else:
             textenc = text.encode()
 
@@ -528,7 +575,6 @@ class Visual(Window):
 
             self.output.lines = o.lines + self.output.lines
             self.output.token_lines = o.token_lines + self.output.token_lines
-            self.first_addr = min(o.addr_line)
 
             for ad, l in self.output.addr_line.items():
                 o.line_addr[nb_new_lines + l] = ad
@@ -544,6 +590,7 @@ class Visual(Window):
             self.output.addr_line = o.addr_line
             self.output.idx_tok_inline_comm = o.idx_tok_inline_comm
             self.token_lines = self.output.token_lines
+            self.set_first_addr()
 
         return wy
 
@@ -653,7 +700,7 @@ class Visual(Window):
         if char == "}":
             l = line - 1
             while l >= 0:
-                if self.output.lines[l][x] != " ":
+                if x < len(self.output.lines[l]) and self.output.lines[l][x] != " ":
                     new_line = l
                     break
                 l -= 1
@@ -676,7 +723,7 @@ class Visual(Window):
 
             l = line + 1
             while l < len(self.output.lines):
-                if self.output.lines[l][x] != " ":
+                if x < len(self.output.lines[l]) and self.output.lines[l][x] != " ":
                     new_line = l
                     break
                 l += 1
@@ -811,8 +858,9 @@ class Visual(Window):
             func_id = self.db.mem.get_func_id(ad)
 
             if func_id == -1:
-                self.status_bar_message("not in a function: create a function or use "
-                                "the cmd x in the console", h, True)
+                self.status_bar_message(
+                    "error: not in a function, create a function or use "
+                    "the cmd x in the console", h, True)
                 return False
 
             ad_disasm = self.db.func_id[func_id]
@@ -831,7 +879,6 @@ class Visual(Window):
             self.win_y = self.dump_update_up(h, self.win_y)
             self.goto_address(ad, h, w)
             self.main_cmd_line_middle(h, w)
-
         return ret
 
 
@@ -951,7 +998,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_offset(ad):
-            self.status_bar_message("not an address", h, True)
+            self.status_bar_message("error: not an address", h, True)
             return False
 
         self.reload_output(h)
@@ -987,7 +1034,7 @@ class Visual(Window):
             if ty == -1 or ty == MEM_UNK:
                 ty = MEM_BYTE
             if ty < MEM_BYTE or ty > MEM_QOFFSET:
-                self.status_bar_message("can't create an array here", h, True)
+                self.status_bar_message("error: can't create an array here", h, True)
                 return False
             sz_entry = self.db.mem.get_size(ad)
 
@@ -1047,7 +1094,7 @@ class Visual(Window):
         ad = self.output.line_addr[line]
 
         if not self.api.set_function(ad):
-            self.status_bar_message("cannot set a function here", h, True)
+            self.status_bar_message("error: cannot set a function here", h, True)
             return False
 
         self.reload_output(h)
@@ -1068,7 +1115,7 @@ class Visual(Window):
 
         ctx = self.gctx.get_addr_context(word)
         if ctx is None:
-            self.status_bar_message("unknown symbol", h, True)
+            self.status_bar_message("error: unknown symbol", h, True)
             return False
 
         if not ctx or (ctx.entry not in self.db.xrefs and
@@ -1117,3 +1164,38 @@ class Visual(Window):
 
     def mouse_double_left_click(self, h, w):
         return self.main_cmd_enter(h, w)
+
+
+    def main_cmd_set_frame_size(self, h, w):
+        line = self.win_y + self.cursor_y
+        if line not in self.output.line_addr:
+            return False
+        ad = self.output.line_addr[line]
+        ad = self.api.get_func_addr(ad)
+
+        if ad is None:
+            self.status_bar_message("error: not in a function", h, True)
+            return False
+
+        frame_size = self.db.functions[ad][FUNC_FRAME_SIZE]
+
+        text = popup_inputbox("frame size", str(frame_size), h, w)
+        try:
+            new_frame_size = int(text)
+        except:
+            self.redraw(h, w)
+            self.status_bar_message("error: not an integer", h)
+            return False
+
+        if new_frame_size == frame_size:
+            return True
+
+        if not self.api.set_frame_size(ad, new_frame_size):
+            self.redraw(h, w)
+            self.status_bar_message("error: bad integer", h)
+            return False
+
+        self.reload_output(h)
+        self.db.modified = True
+
+        return True

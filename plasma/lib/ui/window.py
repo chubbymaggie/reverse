@@ -22,14 +22,11 @@ from curses import A_UNDERLINE, color_pair, A_REVERSE
 from time import time
 
 from plasma.lib.custom_colors import *
+from plasma.lib.consts import *
 
 
 MOUSE_EVENT = [0x1b, 0x5b, 0x4d]
 MOUSE_INTERVAL = 200
-
-MODE_DUMP = 1
-MODE_DECOMPILE = 2
-MODE_OTHER = 3
 
 
 def popup_text(title, output, h_par, w_par):
@@ -107,6 +104,10 @@ class Window():
 
         self.time_last_mouse_key = MOUSE_INTERVAL + 1
         self.set_key_timeout = True
+
+        # Note: all these functions should return a boolean. The value is true
+        # if the screen must be refreshed (not re-drawn, in this case call
+        # explictly self.redraw or self.reload_output if the output changed).
 
         self.mapping = {
             b"\x1b\x5b\x44": self.k_left,

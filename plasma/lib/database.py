@@ -36,7 +36,7 @@ from plasma.lib.utils import info, warning, die
 from plasma.lib.memory import Memory
 
 
-VERSION = 2.6
+VERSION = 2.7
 
 
 class Database():
@@ -65,8 +65,9 @@ class Database():
         #    flags,
         #    dict vars_off -> [type, name],
         #    func_id,
-        #    dict inst.address -> [var_off],
+        #    dict inst.address -> vars_off,
         #    frame_size,
+        #    args_restore,
         #  ]
         self.functions = {}
         self.func_id = {} # id -> func address
