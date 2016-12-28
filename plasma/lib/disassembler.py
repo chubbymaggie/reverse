@@ -159,6 +159,20 @@ class Disassembler():
         self.binary.load_static_sym()
         self.binary.load_dyn_sym()
         self.binary.demangle_symbols()
+
+        ep = self.binary.get_entry_point()
+        if ep not in self.binary.reverse_symbols:
+            name = "_start"
+            n = name
+            i = 0
+            while n in self.binary.symbols:
+                n = "%s_%d" % (name, i)
+                i += 1
+            name = n
+
+            self.binary.symbols[name] = ep
+            self.binary.reverse_symbols[ep] = name
+
         elapsed = time()
         elapsed = elapsed - start
         debug__("Found %d symbols in %fs" % (len(self.binary.symbols), elapsed))
@@ -187,15 +201,6 @@ class Disassembler():
             if val[VAR_NAME] == name:
                 return off
         return None
-
-
-    def var_rename(self, func_ad, off, name):
-        if func_ad not in self.functions:
-            return
-        func_obj = self.functions[func_ad]
-        if func_obj is None:
-            return
-        func_obj[FUNC_VARS][off][VAR_NAME] = name
 
 
     def load_arch_module(self):
@@ -702,18 +707,6 @@ class Disassembler():
         return self.functions[ad][FUNC_FLAGS] & FUNC_FLAG_NORETURN
 
 
-    def import_flags(self, ad):
-        # Check all known functions which never return
-        if ad not in self.binary.imports:
-            return 0
-        name = self.db.reverse_symbols[ad]
-        if self.binary.type == T_BIN_PE:
-            return FUNC_FLAG_NORETURN if name in NORETURN_PE else 0
-        elif self.binary.type == T_BIN_ELF:
-            return FUNC_FLAG_NORETURN if name in NORETURN_ELF else 0
-        return 0
-
-
     # Generate a flow graph of the given function (addr)
     def get_graph(self, entry):
         ARCH_UTILS = self.load_arch_module().utils
@@ -818,7 +811,8 @@ class Disassembler():
                             continue
 
                     if op.type == self.capstone.CS_OP_MEM and \
-                            self.import_flags(op.mem.disp) == FUNC_FLAG_NORETURN:
+                            op.mem.disp in self.binary.imports and \
+                            self.binary.imports[op.mem.disp] & FUNC_FLAG_NORETURN:
                         prefetch = self.__add_prefetch(addresses, inst)
                         gph.new_node(inst, prefetch, None)
                         gph.exit_or_ret.add(ad)

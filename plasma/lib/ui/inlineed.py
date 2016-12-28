@@ -17,20 +17,25 @@
 # along with this program.    If not, see <http://www.gnu.org/licenses/>.
 #
 
-from curses import A_UNDERLINE, color_pair
+from curses import color_pair
 
 from plasma.lib.custom_colors import *
-from plasma.lib.ui.window import Window
 
 
-# TODO: not very clean class...
+MOUSE_EVENT = [0x1b, 0x5b, 0x4d]
+MOUSE_INTERVAL = 200
 
 
-class InlineEd(Window):
-    def __init__(self, h, w, line, xbegin, idx_token, text,
+# TODO: not a very clean class...
+
+
+class InlineEd():
+    def __init__(self, line, xbegin, idx_token, text,
                  color, tok_line):
-        # The window class is only used for the read_escape_keys
-        Window.__init__(self, None, has_statusbar=True)
+        self.set_key_timeout = True
+        self.time_last_mouse_key = MOUSE_INTERVAL + 1
+        self.cursor_y = 0
+        self.cursor_x = 0
 
         self.mapping = {
             b"\x1b\x5b\x44": self.k_left,
@@ -53,7 +58,40 @@ class InlineEd(Window):
         self.tok_line = tok_line
 
 
+    # TODO : copied from lib.ui.window
+    def read_escape_keys(self):
+        if self.set_key_timeout:
+            self.screen.timeout(-1)
+
+        k = self.screen.getch()
+        seq = []
+
+        if k != -1:
+            while k:
+                seq.append(k & 0xff)
+                k >>= 8
+
+            self.screen.timeout(0)
+            for i in range(8):
+                k = self.screen.getch()
+                if k == -1:
+                    break
+                seq.append(k)
+
+                if seq == MOUSE_EVENT:
+                    seq.append(self.screen.getch())
+                    seq.append(self.screen.getch())
+                    seq.append(self.screen.getch())
+                    self.set_key_timeout = False
+                    return bytes(seq)
+
+        self.set_key_timeout = True
+        return bytes(seq)
+
+
+
     def start_view(self, screen):
+        screen.move(0, 1)
         self.screen = screen
         y = self.cursor_y
 
@@ -63,9 +101,6 @@ class InlineEd(Window):
 
         while 1:
             (h, w) = screen.getmaxyx()
-
-            if self.has_statusbar:
-                h -= 1 # status bar
 
             self.screen.move(y, 0)
             self.screen.clrtoeol()

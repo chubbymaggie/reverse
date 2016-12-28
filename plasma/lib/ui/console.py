@@ -187,12 +187,8 @@ class Console():
         self.db = gctx.db
         gctx.vim = False
 
-        # After exiting the visual mode we copy last addresses we have visited.
-        # Then we can just enter 'v' and we go where we were.
-        self.visual_last_entry = None
-        self.visual_last_stack = []
-        self.visual_last_saved_stack = []
-        self.visual_last_mode = MODE_DUMP
+        self.visual_previous_idx = 0
+        self.visual_last_widgets = []
 
         # A hack to allow window resizing
         os.environ['LINES']="blah"
@@ -268,9 +264,10 @@ class Console():
                 self.__exec_v,
                 self.__complete_x,
                 [
-                "[SYMBOL|0xXXXX|EP]",
-                "Visual mode: if no address or symbol is given, you go at the",
-                "previous address before exiting the visual mode.",
+                "[SYMBOL|0xXXXX|EP|%VISUAL]",
+                "Visual mode: if no address is given, previous visual is",
+                "reopen. You can keep up to 3 visuals. Use %1, %2 or %3",
+                "to select the visual.",
                 "",
                 "Main shortcuts:",
                 "c       create code",
@@ -291,6 +288,8 @@ class Console():
                 "B       show/hide bytes",
                 "",
                 "Navigation:",
+                "|       split the window",
+                "j       jump to an address or a symbol",
                 "/       binary search: if the first char is ! you can put an",
                 "        hexa string example: /!ab 13 42",
                 "        the search is case sensitive.",
@@ -474,12 +473,14 @@ class Console():
         self.gctx.dis.binary.api = self.api
 
         if gctx.dis.is_mips and not gctx.dis.mips_gp:
-            print("please run first these commands :")
-            print("mips_set_gp 0xADDRESS")
-            print("push_analyze_symbols")
+            if sys.stdin.isatty():
+                print("please run first these commands :")
+                print("mips_set_gp 0xADDRESS")
+                print("push_analyze_symbols")
         else:
             # If false it means that the first analysis was already done
             if gctx.autoanalyzer and len(self.db.mem) == 0:
+                print("analyzer is running... check the command analyzer to see the status")
                 self.push_analyze_symbols(None)
 
         self.comp = Completer(self)
@@ -719,16 +720,50 @@ class Console():
 
 
     def __exec_v(self, args):
-        if len(args) != 1:
-            ad = args[1]
-            self.visual_last_mode = MODE_DUMP
+        ad = 0
+        if len(args) == 2:
+            if args[1][0] == "%":
+                if len(args[1]) != 2:
+                    print("error: bad visual number")
+                    return
+
+                i = int(args[1][1]) - 1
+                if i < 0 or i >= len(self.visual_last_widgets):
+                    print("error: bad visual number, there are only %d opened visual" % len(self.visual_last_widgets))
+                    return
+                wdgt = self.visual_last_widgets[i]
+            else:
+                ad = args[1]
+                wdgt = None
+                i = None
         else:
-            ad = self.visual_last_entry
-        v = Visual(self.gctx, ad, self.analyzer, self.api,
-               self.visual_last_stack, self.visual_last_saved_stack,
-               self.visual_last_mode)
-        if v.last_curr_line_ad is not None:
-            self.visual_last_entry = v.last_curr_line_ad
+            if not self.visual_last_widgets:
+                ad = None # will open the visual at EP or main
+                i = None
+                wdgt = None
+            else:
+                i = self.visual_previous_idx
+                wdgt = self.visual_last_widgets[i]
+
+        v = Visual(self.gctx, ad, self.analyzer, self.api, wdgt)
+
+        if v.error_occurs:
+            return
+
+        # Only %1, %2, %3 actually
+
+        if i is None:
+            self.visual_last_widgets.append(v.widgets)
+            n = len(self.visual_last_widgets)
+            print("visual saved to %%%d" % n)
+            self.visual_previous_idx = n - 1
+        else:
+            self.visual_last_widgets[i] = v.widgets
+            print("visual saved to %%%d" % (i + 1))
+            self.visual_previous_idx = i
+
+        if len(self.visual_last_widgets) == 4:
+            self.visual_last_widgets = self.visual_last_widgets[1:]
 
 
     def __exec_help(self, args):

@@ -55,9 +55,9 @@ Check tests :
 
     $ plasma -i tests/server.bin
     >> v main
-    # then press tab
-
-![plasma](/images/screenshot.png?raw=true)
+    # you can press tab to show the pseudo decompilation
+    # | to split the window
+    # See the command help for all shortcuts
 
 ![plasma](/images/visual.png?raw=true)
 
