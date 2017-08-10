@@ -234,6 +234,7 @@ static inline void reg_add(struct regs_context *self, int r, int v1, int v2)
     if (r == MIPS_REG_ZERO)
         return;
     *((int*) &self->regs[r]) = v1 + v2;
+    self->is_def[r] = true;
 }
 
 static inline void reg_sub(struct regs_context *self, int r, int v1, int v2)
@@ -241,6 +242,7 @@ static inline void reg_sub(struct regs_context *self, int r, int v1, int v2)
     if (r == MIPS_REG_ZERO)
         return;
     *((int*) &self->regs[r]) = v1 - v2;
+    self->is_def[r] = true;
 }
 
 static inline void reg_or(struct regs_context *self, int r, int v1, int v2)
@@ -248,6 +250,7 @@ static inline void reg_or(struct regs_context *self, int r, int v1, int v2)
     if (r == MIPS_REG_ZERO)
         return;
     *((int*) &self->regs[r]) = v1 | v2;
+    self->is_def[r] = true;
 }
 
 static inline void reg_and(struct regs_context *self, int r, int v1, int v2)
@@ -255,6 +258,7 @@ static inline void reg_and(struct regs_context *self, int r, int v1, int v2)
     if (r == MIPS_REG_ZERO)
         return;
     *((int*) &self->regs[r]) = v1 & v2;
+    self->is_def[r] = true;
 }
 
 static inline void reg_xor(struct regs_context *self, int r, int v1, int v2)
@@ -262,6 +266,7 @@ static inline void reg_xor(struct regs_context *self, int r, int v1, int v2)
     if (r == MIPS_REG_ZERO)
         return;
     *((int*) &self->regs[r]) = v1 ^ v2;
+    self->is_def[r] = true;
 }
 
 static PyObject* get_sp(PyObject *self, PyObject *args)
@@ -544,6 +549,7 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
     long values[3] = {0, 0, 0};
     bool is_stack[3] = {false, false, false};
     bool err[3];
+    bool is_load_insn = len_ops == 2 && is_load(id);
 
     // The first operand is always a register and always the destination (except st* ?)
     int r1 = get_op_reg(ops[0]);
@@ -573,8 +579,8 @@ static PyObject* analyze_operands(PyObject *self, PyObject *args)
             }
         }
 
-        PyObject_CallMethod(analyzer, "analyze_imm", "OOiB",
-                            insn, ops[i], values[i], false);
+        PyObject_CallMethod(analyzer, "analyze_imm", "OOiBB",
+                            insn, ops[i], values[i], false, is_load_insn);
     }
 
     // err[0] = !is_reg_supported(r1)
@@ -665,7 +671,8 @@ save_imm:
         if (use_real_gp) {
             if (id != MIPS_INS_LUI) {
                 PyObject *ret = PyObject_CallMethod(
-                        analyzer, "analyze_imm", "OOiB", insn, ops[0], v, true);
+                        analyzer, "analyze_imm", "OOiBB",
+                        insn, ops[0], v, true, is_load_insn);
                 save = ret == Py_True;
             }
         }

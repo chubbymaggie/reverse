@@ -278,7 +278,7 @@ class Analyzer(threading.Thread):
     # Do an analysis if the immediate is an address
     # If from_save_imm is true, op is the destination where we save imm
     # -> inst op, computed_imm
-    def analyze_imm(self, i, op, imm, from_save_imm):
+    def analyze_imm(self, i, op, imm, from_save_imm, is_deref_pointer):
         if imm <= 1024:
             return False
 
@@ -327,7 +327,7 @@ class Analyzer(threading.Thread):
         if ty == MEM_UNK:
             # Do an analysis on this value, if this is not code
             # nothing will be done.
-            if s.is_exec and self.first_inst_are_code(ad):
+            if not is_deref_pointer and s.is_exec and self.first_inst_are_code(ad):
                 self.analyze_flow(
                         ad,
                         entry_is_func=self.has_prolog(ad),
@@ -594,6 +594,10 @@ class Analyzer(threading.Thread):
 
         while stack:
             (regsctx, ad) = stack.pop()
+
+            if self.db.mem.is_data(ad):
+                continue
+
             inst = self.disasm(ad)
 
             if inst is None:
